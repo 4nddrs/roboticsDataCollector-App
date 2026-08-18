@@ -45,6 +45,7 @@ import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.filled.CheckCircle
 import androidx.compose.material.icons.filled.Error
+import androidx.compose.material.icons.filled.Folder
 import androidx.compose.material.icons.filled.FiberManualRecord
 import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material.icons.filled.Stop
@@ -56,6 +57,7 @@ import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.ExtendedFloatingActionButton
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
+import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.Surface
@@ -127,22 +129,29 @@ class MainActivity : ComponentActivity() {
 
         setContent {
             RoboticsDataCollectorTheme {
-                DataCollectionScreen(
-                    sensorDataManager = sensorDataManager,
-                    guardian = guardian,
-                    eventLogger = eventLogger,
-                    videoRecorder = videoRecorder,
-                    sessionSafety = sessionSafety,
-                    analysisExecutor = analysisExecutor!!,
-                    emergencyStop = emergencyStop,
-                    onKeepScreenOn = { enabled ->
-                        if (enabled) {
-                            window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
-                        } else {
-                            window.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+                var destination by remember { mutableStateOf(AppScreen.Capture) }
+                when (destination) {
+                    AppScreen.Capture -> DataCollectionScreen(
+                        sensorDataManager = sensorDataManager,
+                        guardian = guardian,
+                        eventLogger = eventLogger,
+                        videoRecorder = videoRecorder,
+                        sessionSafety = sessionSafety,
+                        analysisExecutor = analysisExecutor!!,
+                        emergencyStop = emergencyStop,
+                        onOpenSessions = { destination = AppScreen.Sessions },
+                        onKeepScreenOn = { enabled ->
+                            if (enabled) {
+                                window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+                            } else {
+                                window.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+                            }
                         }
-                    }
-                )
+                    )
+                    AppScreen.Sessions -> SessionManagerScreen(
+                        onBack = { destination = AppScreen.Capture }
+                    )
+                }
             }
         }
     }
@@ -247,6 +256,8 @@ class MainActivity : ComponentActivity() {
     }
 }
 
+private enum class AppScreen { Capture, Sessions }
+
 private val REQUIRED_PERMISSIONS = arrayOf(
     Manifest.permission.CAMERA,
     Manifest.permission.RECORD_AUDIO
@@ -261,6 +272,7 @@ fun DataCollectionScreen(
     sessionSafety: SessionSafetyManager,
     analysisExecutor: ExecutorService,
     emergencyStop: AtomicReference<((String) -> Unit)?>,
+    onOpenSessions: () -> Unit,
     onKeepScreenOn: (Boolean) -> Unit
 ) {
     val context = LocalContext.current
@@ -623,6 +635,37 @@ fun DataCollectionScreen(
                     .navigationBarsPadding()
                     .padding(start = 20.dp, end = 20.dp, bottom = 118.dp)
             )
+        }
+
+        if (!isRecording) {
+            Surface(
+                onClick = onOpenSessions,
+                shape = RoundedCornerShape(20.dp),
+                color = Color(0xCC111111),
+                modifier = Modifier
+                    .align(Alignment.TopEnd)
+                    .statusBarsPadding()
+                    .padding(top = 80.dp, end = 16.dp)
+            ) {
+                Row(
+                    modifier = Modifier.padding(horizontal = 12.dp, vertical = 8.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(6.dp)
+                ) {
+                    Icon(
+                        imageVector = Icons.Filled.Folder,
+                        contentDescription = null,
+                        tint = Color.White,
+                        modifier = Modifier.size(18.dp)
+                    )
+                    Text(
+                        text = "Sessions",
+                        color = Color.White,
+                        fontWeight = FontWeight.SemiBold,
+                        fontSize = 12.sp
+                    )
+                }
+            }
         }
     }
 }
