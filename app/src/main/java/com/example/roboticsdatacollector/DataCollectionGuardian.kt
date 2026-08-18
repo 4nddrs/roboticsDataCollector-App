@@ -44,6 +44,13 @@ class DataCollectionGuardian(
     private val lastAnalyzedElapsedNs = AtomicLong(0L)
     private val totalAnalyzedFrames = AtomicInteger(0)
     private val handDetectedFrames = AtomicInteger(0)
+    private val blurredFrames = AtomicInteger(0)
+    private val underexposedFrames = AtomicInteger(0)
+    private val overexposedFrames = AtomicInteger(0)
+    private val blurStreak = AtomicInteger(0)
+    private val darkStreak = AtomicInteger(0)
+    private val brightStreak = AtomicInteger(0)
+    private val qualityAnalyzer = FrameQualityAnalyzer()
     private val landmarkerRef = AtomicReference<HandLandmarker?>(null)
     private val initAttempted = AtomicBoolean(false)
 
@@ -59,13 +66,23 @@ class DataCollectionGuardian(
     private val _analyzedFrameCount = MutableStateFlow(0)
     val analyzedFrameCount: StateFlow<Int> = _analyzedFrameCount.asStateFlow()
 
+    private val _qualityWarning = MutableStateFlow(QualityWarning.None)
+    val qualityWarning: StateFlow<QualityWarning> = _qualityWarning.asStateFlow()
+
     fun start() {
         ensureLandmarker()
         totalAnalyzedFrames.set(0)
         handDetectedFrames.set(0)
+        blurredFrames.set(0)
+        underexposedFrames.set(0)
+        overexposedFrames.set(0)
+        blurStreak.set(0)
+        darkStreak.set(0)
+        brightStreak.set(0)
         lastAnalyzedElapsedNs.set(0L)
         _analyzedFrameCount.value = 0
         _isHandVisible.value = false
+        _qualityWarning.value = QualityWarning.None
         running.set(true)
         Log.i(TAG, "Guardian started backend=$detectorBackend fps=$targetAnalysisFps")
     }
@@ -86,13 +103,16 @@ class DataCollectionGuardian(
     }
 
     fun snapshotSummary(): MetadataManager.GuardianSummary {
-        val total = totalAnalyzedFrames.get()
+        val total = totalAnalyzedFrames.get().coerceAtLeast(0)
         val hits = handDetectedFrames.get()
-        val percentage = if (total == 0) 0.0 else (100.0 * hits / total)
+        fun pct(count: Int): Double = if (total == 0) 0.0 else 100.0 * count / total
         return MetadataManager.GuardianSummary(
-            handsDetectedPercentage = percentage,
+            handsDetectedPercentage = pct(hits),
             totalAnalyzedFrames = total,
             handDetectedFrames = hits,
+            blurredFramesPercentage = pct(blurredFrames.get()),
+            underexposedFramesPercentage = pct(underexposedFrames.get()),
+            overexposedFramesPercentage = pct(overexposedFrames.get()),
             detector = detectorBackend.metadataName,
             modelAsset = MODEL_ASSET
         )
@@ -109,9 +129,15 @@ class DataCollectionGuardian(
 
             ensureLandmarker()
 
+            val quality = qualityAnalyzer.analyze(image)
             val visible = detectHands(image)
             val total = totalAnalyzedFrames.incrementAndGet()
             if (visible) handDetectedFrames.incrementAndGet()
+            if (quality.isBlurred) blurredFrames.incrementAndGet()
+            if (quality.isUnderexposed) underexposedFrames.incrementAndGet()
+            if (quality.isOverexposed) overexposedFrames.incrementAndGet()
+
+            updateQualityWarning(quality)
 
             _isHandVisible.value = visible
             _analyzedFrameCount.value = total
@@ -119,6 +145,29 @@ class DataCollectionGuardian(
             Log.e(TAG, "Frame analysis failed", e)
         } finally {
             image.close()
+        }
+    }
+
+    /**
+     * Shows a HUD warning only after the defect is sustained for ~1 second
+     * (~[targetAnalysisFps] consecutive analyzed frames).
+     */
+    private fun updateQualityWarning(quality: FrameQuality) {
+        val needed = targetAnalysisFps.coerceIn(3, 5)
+        val blur = if (quality.isBlurred) blurStreak.incrementAndGet() else {
+            blurStreak.set(0); 0
+        }
+        val dark = if (quality.isUnderexposed) darkStreak.incrementAndGet() else {
+            darkStreak.set(0); 0
+        }
+        val bright = if (quality.isOverexposed) brightStreak.incrementAndGet() else {
+            brightStreak.set(0); 0
+        }
+        _qualityWarning.value = when {
+            dark >= needed -> QualityWarning.TooDark
+            bright >= needed -> QualityWarning.TooBright
+            blur >= needed -> QualityWarning.TooMuchMotion
+            else -> QualityWarning.None
         }
     }
 

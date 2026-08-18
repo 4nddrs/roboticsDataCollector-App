@@ -19,6 +19,9 @@ object MetadataManager {
         val handsDetectedPercentage: Double,
         val totalAnalyzedFrames: Int,
         val handDetectedFrames: Int = 0,
+        val blurredFramesPercentage: Double = 0.0,
+        val underexposedFramesPercentage: Double = 0.0,
+        val overexposedFramesPercentage: Double = 0.0,
         val detector: String = "mediapipe_hands",
         val modelAsset: String = "hand_landmarker.task"
     )
@@ -52,6 +55,9 @@ object MetadataManager {
                 put("hands_detected_percentage", round2(metadata.guardianSummary.handsDetectedPercentage))
                 put("total_analyzed_frames", metadata.guardianSummary.totalAnalyzedFrames)
                 put("hand_detected_frames", metadata.guardianSummary.handDetectedFrames)
+                put("blurred_frames_percentage", round2(metadata.guardianSummary.blurredFramesPercentage))
+                put("underexposed_frames_percentage", round2(metadata.guardianSummary.underexposedFramesPercentage))
+                put("overexposed_frames_percentage", round2(metadata.guardianSummary.overexposedFramesPercentage))
                 put("detector", metadata.guardianSummary.detector)
                 put("model_asset", metadata.guardianSummary.modelAsset)
             }

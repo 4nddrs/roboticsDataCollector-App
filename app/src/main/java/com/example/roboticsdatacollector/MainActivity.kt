@@ -287,6 +287,7 @@ fun DataCollectionScreen(
 
     val isHandVisible by guardian.isHandVisible.collectAsState()
     val analyzedFrameCount by guardian.analyzedFrameCount.collectAsState()
+    val qualityWarning by guardian.qualityWarning.collectAsState()
     val eventFlash by eventLogger.flash.collectAsState()
 
     LaunchedEffect(eventFlash?.timestampNs) {
@@ -489,6 +490,7 @@ fun DataCollectionScreen(
             analyzedFrameCount = analyzedFrameCount,
             recError = recError,
             eventFlash = eventFlash,
+            qualityWarning = qualityWarning,
             modifier = Modifier
                 .fillMaxWidth()
                 .statusBarsPadding()
@@ -557,6 +559,7 @@ private fun CollectionHud(
     analyzedFrameCount: Int,
     recError: String?,
     eventFlash: EventFlash?,
+    qualityWarning: QualityWarning,
     modifier: Modifier = Modifier
 ) {
     Column(
@@ -573,6 +576,19 @@ private fun CollectionHud(
                 isHandVisible = isHandVisible,
                 analyzedFrameCount = analyzedFrameCount,
                 sessionActive = isRecording
+            )
+        }
+        if (isRecording && qualityWarning.kind != QualityWarningKind.NONE && qualityWarning.message != null) {
+            Text(
+                text = qualityWarning.message,
+                color = Color.White,
+                fontWeight = FontWeight.SemiBold,
+                fontSize = 13.sp,
+                modifier = Modifier
+                    .align(Alignment.CenterHorizontally)
+                    .clip(RoundedCornerShape(20.dp))
+                    .background(Color(0xCCF9A825))
+                    .padding(horizontal = 14.dp, vertical = 7.dp)
             )
         }
         recError?.let { msg ->
