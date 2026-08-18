@@ -40,14 +40,23 @@ import androidx.compose.foundation.layout.statusBarsPadding
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.verticalScroll
+import androidx.compose.material.icons.filled.CheckCircle
+import androidx.compose.material.icons.filled.Error
 import androidx.compose.material.icons.filled.FiberManualRecord
+import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material.icons.filled.Stop
 import androidx.compose.material.icons.filled.VideocamOff
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
+import androidx.compose.material3.Card
+import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.ExtendedFloatingActionButton
+import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
@@ -69,6 +78,8 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.viewinterop.AndroidView
 import androidx.core.content.ContextCompat
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.LifecycleEventObserver
 import androidx.lifecycle.compose.LocalLifecycleOwner
 import com.example.roboticsdatacollector.ui.theme.RoboticsDataCollectorTheme
 import kotlinx.coroutines.delay
@@ -139,6 +150,14 @@ fun DataCollectionScreen(
 ) {
     val context = LocalContext.current
     val lifecycleOwner = LocalLifecycleOwner.current
+    val preFlightChecker = remember { PreFlightChecker(context) }
+    var preFlight by remember { mutableStateOf(preFlightChecker.evaluate()) }
+    var showPreFlightOverlay by remember { mutableStateOf(true) }
+    var preFlightAtSessionStart by remember { mutableStateOf<PreFlightReport?>(null) }
+
+    fun refreshPreFlight() {
+        preFlight = preFlightChecker.evaluate()
+    }
 
     var permissionsGranted by remember {
         mutableStateOf(
@@ -152,6 +171,7 @@ fun DataCollectionScreen(
         ActivityResultContracts.RequestMultiplePermissions()
     ) { result ->
         permissionsGranted = REQUIRED_PERMISSIONS.all { result[it] == true }
+        refreshPreFlight()
         if (!permissionsGranted) {
             Toast.makeText(
                 context,
@@ -162,9 +182,20 @@ fun DataCollectionScreen(
     }
 
     LaunchedEffect(Unit) {
+        refreshPreFlight()
         if (!permissionsGranted) {
             permissionLauncher.launch(REQUIRED_PERMISSIONS)
         }
+    }
+
+    DisposableEffect(lifecycleOwner) {
+        val observer = LifecycleEventObserver { _, event ->
+            if (event == Lifecycle.Event.ON_RESUME) {
+                refreshPreFlight()
+            }
+        }
+        lifecycleOwner.lifecycle.addObserver(observer)
+        onDispose { lifecycleOwner.lifecycle.removeObserver(observer) }
     }
 
     var isRecording by remember { mutableStateOf(false) }
@@ -224,7 +255,12 @@ fun DataCollectionScreen(
             } catch (_: Exception) {
             }
             sessionRef.get()?.let { session ->
-                writeSessionMetadata(session, guardian, status = "aborted")
+                writeSessionMetadata(
+                    session,
+                    guardian,
+                    status = "aborted",
+                    preFlight = preFlightAtSessionStart
+                )
             }
             guardian.stop()
             sensorLogger.stopLogging()
@@ -245,7 +281,12 @@ fun DataCollectionScreen(
         guardian.stop()
         sensorLogger.stopLogging()
         session?.let {
-            writeSessionMetadata(it, guardianSummary = summary, status = "completed")
+            writeSessionMetadata(
+                it,
+                guardianSummary = summary,
+                status = "completed",
+                preFlight = preFlightAtSessionStart
+            )
         }
         sessionRef.set(null)
         currentSession = null
@@ -256,10 +297,23 @@ fun DataCollectionScreen(
 
     fun startSession() {
         recError = null
+        refreshPreFlight()
+        val snapshot = preFlightChecker.evaluate()
+        preFlight = snapshot
+        if (!snapshot.canStartSession) {
+            showPreFlightOverlay = true
+            Toast.makeText(
+                context,
+                "Pre-flight check failed. Fix the items in red and tap Re-check.",
+                Toast.LENGTH_LONG
+            ).show()
+            return
+        }
         try {
             val session = SessionFiles.create(context.getExternalFilesDir(null))
             currentSession = session
             sessionRef.set(session)
+            preFlightAtSessionStart = snapshot
 
             sensorLogger.startLogging(session.imuFile)
             guardian.start()
@@ -287,7 +341,12 @@ fun DataCollectionScreen(
                                 guardian.stop()
                                 sensorLogger.stopLogging()
                                 currentSession?.let {
-                                    writeSessionMetadata(it, failedSummary, status = "error")
+                                    writeSessionMetadata(
+                                        it,
+                                        failedSummary,
+                                        status = "error",
+                                        preFlight = preFlightAtSessionStart
+                                    )
                                 }
                             } catch (_: Exception) {
                             }
@@ -344,18 +403,46 @@ fun DataCollectionScreen(
 
         SessionControlPanel(
             isRecording = isRecording,
+            startEnabled = preFlight.canStartSession,
             onToggle = {
-                if (!permissionsGranted) {
-                    permissionLauncher.launch(REQUIRED_PERMISSIONS)
+                if (isRecording) {
+                    stopSession()
                     return@SessionControlPanel
                 }
-                if (isRecording) stopSession() else startSession()
+                if (!preFlight.canStartSession) {
+                    showPreFlightOverlay = true
+                    if (!preFlight.permissionsPassed) {
+                        permissionLauncher.launch(REQUIRED_PERMISSIONS)
+                    } else {
+                        refreshPreFlight()
+                    }
+                    return@SessionControlPanel
+                }
+                startSession()
             },
             modifier = Modifier
                 .align(Alignment.BottomCenter)
                 .navigationBarsPadding()
                 .padding(horizontal = 20.dp, vertical = 20.dp)
         )
+
+        if (showPreFlightOverlay && !isRecording) {
+            PreFlightOverlay(
+                report = preFlight,
+                onRefresh = { refreshPreFlight() },
+                onRequestPermissions = { permissionLauncher.launch(REQUIRED_PERMISSIONS) },
+                onContinue = { showPreFlightOverlay = false }
+            )
+        } else if (!isRecording) {
+            PreFlightCompactBar(
+                report = preFlight,
+                onOpen = { showPreFlightOverlay = true },
+                modifier = Modifier
+                    .align(Alignment.BottomCenter)
+                    .navigationBarsPadding()
+                    .padding(start = 20.dp, end = 20.dp, bottom = 118.dp)
+            )
+        }
     }
 }
 
@@ -494,6 +581,7 @@ private fun GuardianStatusBadge(
 @Composable
 private fun SessionControlPanel(
     isRecording: Boolean,
+    startEnabled: Boolean,
     onToggle: () -> Unit,
     modifier: Modifier = Modifier
 ) {
@@ -504,11 +592,11 @@ private fun SessionControlPanel(
         tonalElevation = 6.dp,
         shadowElevation = 8.dp
     ) {
-        Box(
+        Column(
             modifier = Modifier
                 .fillMaxWidth()
                 .padding(horizontal = 16.dp, vertical = 14.dp),
-            contentAlignment = Alignment.Center
+            horizontalAlignment = Alignment.CenterHorizontally
         ) {
             ExtendedFloatingActionButton(
                 onClick = onToggle,
@@ -524,8 +612,179 @@ private fun SessionControlPanel(
                         fontWeight = FontWeight.Bold
                     )
                 },
-                containerColor = if (isRecording) Color(0xFFC62828) else MaterialTheme.colorScheme.primary,
+                containerColor = when {
+                    isRecording -> Color(0xFFC62828)
+                    startEnabled -> MaterialTheme.colorScheme.primary
+                    else -> Color(0xFF616161)
+                },
                 contentColor = Color.White
+            )
+            if (!isRecording && !startEnabled) {
+                Text(
+                    text = "Blocked until pre-flight checks pass",
+                    color = Color(0xFFFFCDD2),
+                    fontSize = 12.sp,
+                    modifier = Modifier.padding(top = 8.dp)
+                )
+            }
+        }
+    }
+}
+
+@Composable
+private fun PreFlightOverlay(
+    report: PreFlightReport,
+    onRefresh: () -> Unit,
+    onRequestPermissions: () -> Unit,
+    onContinue: () -> Unit
+) {
+    Surface(
+        modifier = Modifier.fillMaxSize(),
+        color = Color(0xE6111111)
+    ) {
+        Card(
+            modifier = Modifier
+                .fillMaxSize()
+                .statusBarsPadding()
+                .navigationBarsPadding()
+                .padding(20.dp),
+            colors = CardDefaults.cardColors(containerColor = Color(0xFF1C1C1E)),
+            shape = RoundedCornerShape(24.dp)
+        ) {
+            Column(
+                modifier = Modifier
+                    .fillMaxSize()
+                    .padding(20.dp)
+            ) {
+                Text(
+                    text = "Pre-Flight Check",
+                    color = Color.White,
+                    fontWeight = FontWeight.Bold,
+                    fontSize = 22.sp
+                )
+                Text(
+                    text = "All items must pass before a session can start.",
+                    color = Color(0xFFBDBDBD),
+                    fontSize = 13.sp,
+                    modifier = Modifier.padding(top = 4.dp, bottom = 16.dp)
+                )
+                HorizontalDivider(color = Color(0x33FFFFFF))
+                Column(
+                    modifier = Modifier
+                        .weight(1f)
+                        .verticalScroll(rememberScrollState())
+                        .padding(vertical = 12.dp),
+                    verticalArrangement = Arrangement.spacedBy(12.dp)
+                ) {
+                    PreFlightRow("Storage Space", report.storageDetail, report.storagePassed)
+                    PreFlightRow("Battery Status", report.batteryDetail, report.batteryPassed)
+                    PreFlightRow("IMU Sensors", report.sensorsDetail, report.sensorsPassed)
+                    PreFlightRow("Hardware Permissions", report.permissionsDetail, report.permissionsPassed)
+                }
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(10.dp)
+                ) {
+                    OutlinedButton(
+                        onClick = onRefresh,
+                        modifier = Modifier.weight(1f)
+                    ) {
+                        Icon(
+                            imageVector = Icons.Filled.Refresh,
+                            contentDescription = null,
+                            modifier = Modifier
+                                .size(18.dp)
+                                .padding(end = 4.dp)
+                        )
+                        Text("Re-check")
+                    }
+                    if (!report.permissionsPassed) {
+                        Button(
+                            onClick = onRequestPermissions,
+                            modifier = Modifier.weight(1f)
+                        ) {
+                            Text("Grant access")
+                        }
+                    } else {
+                        Button(
+                            onClick = onContinue,
+                            enabled = report.canStartSession,
+                            modifier = Modifier.weight(1f)
+                        ) {
+                            Text("Continue")
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun PreFlightRow(title: String, detail: String, passed: Boolean) {
+    val accent = if (passed) Color(0xFF2E7D32) else Color(0xFFC62828)
+    val icon = if (passed) Icons.Filled.CheckCircle else Icons.Filled.Error
+    val mark = if (passed) "🟢" else "🔴"
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .clip(RoundedCornerShape(14.dp))
+            .background(Color(0xFF2A2A2C))
+            .padding(14.dp),
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(12.dp)
+    ) {
+        Icon(imageVector = icon, contentDescription = null, tint = accent)
+        Column(modifier = Modifier.weight(1f)) {
+            Text(
+                text = "$mark $title",
+                color = Color.White,
+                fontWeight = FontWeight.SemiBold,
+                fontSize = 14.sp
+            )
+            Text(
+                text = detail,
+                color = Color(0xFFBDBDBD),
+                fontSize = 12.sp,
+                modifier = Modifier.padding(top = 2.dp)
+            )
+        }
+    }
+}
+
+@Composable
+private fun PreFlightCompactBar(
+    report: PreFlightReport,
+    onOpen: () -> Unit,
+    modifier: Modifier = Modifier
+) {
+    val accent = if (report.allPassed) Color(0xFF2E7D32) else Color(0xFFF9A825)
+    Surface(
+        onClick = onOpen,
+        modifier = modifier.fillMaxWidth(),
+        shape = RoundedCornerShape(18.dp),
+        color = Color(0xCC111111)
+    ) {
+        Row(
+            modifier = Modifier.padding(horizontal = 14.dp, vertical = 10.dp),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(8.dp)
+        ) {
+            Box(
+                modifier = Modifier
+                    .size(8.dp)
+                    .clip(CircleShape)
+                    .background(accent)
+            )
+            Text(
+                text = if (report.allPassed) {
+                    "Pre-flight OK · tap to review"
+                } else {
+                    "Pre-flight failed · tap to fix"
+                },
+                color = Color.White,
+                fontSize = 12.sp,
+                fontWeight = FontWeight.Medium
             )
         }
     }
@@ -601,15 +860,17 @@ private data class SessionFiles(
 private fun writeSessionMetadata(
     session: SessionFiles,
     guardian: DataCollectionGuardian,
-    status: String
+    status: String,
+    preFlight: PreFlightReport?
 ) {
-    writeSessionMetadata(session, guardian.snapshotSummary(), status)
+    writeSessionMetadata(session, guardian.snapshotSummary(), status, preFlight)
 }
 
 private fun writeSessionMetadata(
     session: SessionFiles,
     guardianSummary: MetadataManager.GuardianSummary,
-    status: String
+    status: String,
+    preFlight: PreFlightReport?
 ) {
     val endNs = SystemClock.elapsedRealtimeNanos()
     MetadataManager.write(
@@ -621,6 +882,7 @@ private fun writeSessionMetadata(
             videoFile = session.videoFile.name,
             imuFile = session.imuFile.name,
             guardianSummary = guardianSummary,
+            preFlightStatus = preFlight,
             status = status
         )
     )

@@ -33,6 +33,7 @@ object MetadataManager {
         val targetFps: Int = TARGET_FPS,
         val resolution: String = RESOLUTION,
         val guardianSummary: GuardianSummary,
+        val preFlightStatus: PreFlightReport? = null,
         val status: String = "completed"
     ) {
         val durationSeconds: Double
@@ -64,6 +65,10 @@ object MetadataManager {
                 put("target_fps", metadata.targetFps)
                 put("resolution", metadata.resolution)
                 put("guardian_summary", guardian)
+                put(
+                    "pre_flight_status",
+                    metadata.preFlightStatus?.toJson() ?: JSONObject().put("passed", false)
+                )
                 put("status", metadata.status)
             }
             outputFile.writeText(json.toString(2))
