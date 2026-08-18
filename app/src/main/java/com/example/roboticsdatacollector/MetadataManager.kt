@@ -2,6 +2,7 @@ package com.example.roboticsdatacollector
 
 import android.os.Build
 import android.util.Log
+import org.json.JSONArray
 import org.json.JSONObject
 import java.io.File
 
@@ -34,6 +35,7 @@ object MetadataManager {
         val resolution: String = RESOLUTION,
         val guardianSummary: GuardianSummary,
         val preFlightStatus: PreFlightReport? = null,
+        val events: List<SessionEvent> = emptyList(),
         val status: String = "completed"
     ) {
         val durationSeconds: Double
@@ -68,6 +70,12 @@ object MetadataManager {
                 put(
                     "pre_flight_status",
                     metadata.preFlightStatus?.toJson() ?: JSONObject().put("passed", false)
+                )
+                put(
+                    "events",
+                    JSONArray().apply {
+                        metadata.events.forEach { put(it.toJson()) }
+                    }
                 )
                 put("status", metadata.status)
             }

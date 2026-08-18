@@ -5,8 +5,11 @@ import android.content.pm.PackageManager
 import android.os.Bundle
 import android.os.SystemClock
 import android.util.Log
+import android.view.KeyEvent
 import android.view.WindowManager
 import android.widget.Toast
+import android.os.Handler
+import android.os.Looper
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
@@ -93,13 +96,28 @@ class MainActivity : ComponentActivity() {
 
     private lateinit var sensorLogger: SensorLogger
     private lateinit var guardian: DataCollectionGuardian
+    private lateinit var eventLogger: SessionEventLogger
     private var analysisExecutor: ExecutorService? = null
+
+    private val keyHandler = Handler(Looper.getMainLooper())
+    private var volumeDownDownAtMs = 0L
+    private var volumeDownLongFired = false
+    private var lastVolumeDownUpMs = 0L
+    private var pendingSuccess = false
+
+    private val commitVolumeDownSuccess = Runnable {
+        if (pendingSuccess) {
+            pendingSuccess = false
+            eventLogger.record(SessionEvent.SUCCESS)
+        }
+    }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         enableEdgeToEdge()
         sensorLogger = SensorLogger(this)
         guardian = DataCollectionGuardian(this, targetAnalysisFps = 4)
+        eventLogger = SessionEventLogger(HapticFeedbackManager(this))
         analysisExecutor = Executors.newSingleThreadExecutor()
 
         setContent {
@@ -107,6 +125,7 @@ class MainActivity : ComponentActivity() {
                 DataCollectionScreen(
                     sensorLogger = sensorLogger,
                     guardian = guardian,
+                    eventLogger = eventLogger,
                     analysisExecutor = analysisExecutor!!,
                     onKeepScreenOn = { enabled ->
                         if (enabled) {
@@ -120,7 +139,65 @@ class MainActivity : ComponentActivity() {
         }
     }
 
+    override fun onKeyDown(keyCode: Int, event: KeyEvent): Boolean {
+        if (!eventLogger.isRecording) return super.onKeyDown(keyCode, event)
+        return when (keyCode) {
+            KeyEvent.KEYCODE_VOLUME_UP -> {
+                if (event.repeatCount == 0) {
+                    eventLogger.record(SessionEvent.MARK)
+                }
+                true
+            }
+            KeyEvent.KEYCODE_VOLUME_DOWN -> {
+                if (event.repeatCount == 0) {
+                    volumeDownDownAtMs = SystemClock.elapsedRealtime()
+                    volumeDownLongFired = false
+                } else if (
+                    !volumeDownLongFired &&
+                    event.eventTime - event.downTime >= VOLUME_DOWN_LONG_PRESS_MS
+                ) {
+                    volumeDownLongFired = true
+                    pendingSuccess = false
+                    keyHandler.removeCallbacks(commitVolumeDownSuccess)
+                    eventLogger.record(SessionEvent.FAILURE)
+                }
+                true
+            }
+            else -> super.onKeyDown(keyCode, event)
+        }
+    }
+
+    override fun onKeyUp(keyCode: Int, event: KeyEvent): Boolean {
+        if (!eventLogger.isRecording) return super.onKeyUp(keyCode, event)
+        return when (keyCode) {
+            KeyEvent.KEYCODE_VOLUME_UP -> true
+            KeyEvent.KEYCODE_VOLUME_DOWN -> {
+                if (volumeDownLongFired) {
+                    volumeDownLongFired = false
+                } else {
+                    val now = SystemClock.elapsedRealtime()
+                    val isDoublePress =
+                        lastVolumeDownUpMs > 0L && now - lastVolumeDownUpMs <= VOLUME_DOWN_DOUBLE_PRESS_MS
+                    if (isDoublePress) {
+                        pendingSuccess = false
+                        keyHandler.removeCallbacks(commitVolumeDownSuccess)
+                        eventLogger.record(SessionEvent.FAILURE)
+                        lastVolumeDownUpMs = 0L
+                    } else {
+                        pendingSuccess = true
+                        lastVolumeDownUpMs = now
+                        keyHandler.removeCallbacks(commitVolumeDownSuccess)
+                        keyHandler.postDelayed(commitVolumeDownSuccess, VOLUME_DOWN_DOUBLE_PRESS_MS)
+                    }
+                }
+                true
+            }
+            else -> super.onKeyUp(keyCode, event)
+        }
+    }
+
     override fun onDestroy() {
+        keyHandler.removeCallbacks(commitVolumeDownSuccess)
         try {
             guardian.close()
             sensorLogger.release()
@@ -133,6 +210,8 @@ class MainActivity : ComponentActivity() {
 
     companion object {
         private const val TAG = "MainActivity"
+        private const val VOLUME_DOWN_LONG_PRESS_MS = 450L
+        private const val VOLUME_DOWN_DOUBLE_PRESS_MS = 320L
     }
 }
 
@@ -145,6 +224,7 @@ private val REQUIRED_PERMISSIONS = arrayOf(
 fun DataCollectionScreen(
     sensorLogger: SensorLogger,
     guardian: DataCollectionGuardian,
+    eventLogger: SessionEventLogger,
     analysisExecutor: ExecutorService,
     onKeepScreenOn: (Boolean) -> Unit
 ) {
@@ -207,6 +287,13 @@ fun DataCollectionScreen(
 
     val isHandVisible by guardian.isHandVisible.collectAsState()
     val analyzedFrameCount by guardian.analyzedFrameCount.collectAsState()
+    val eventFlash by eventLogger.flash.collectAsState()
+
+    LaunchedEffect(eventFlash?.timestampNs) {
+        if (eventFlash == null) return@LaunchedEffect
+        delay(1_400)
+        eventLogger.clearFlash()
+    }
 
     var elapsedMs by remember { mutableLongStateOf(0L) }
     LaunchedEffect(isRecording) {
@@ -259,7 +346,8 @@ fun DataCollectionScreen(
                     session,
                     guardian,
                     status = "aborted",
-                    preFlight = preFlightAtSessionStart
+                    preFlight = preFlightAtSessionStart,
+                    events = eventLogger.endSession()
                 )
             }
             guardian.stop()
@@ -280,12 +368,14 @@ fun DataCollectionScreen(
         recordingRef.set(null)
         guardian.stop()
         sensorLogger.stopLogging()
+        val events = eventLogger.endSession()
         session?.let {
             writeSessionMetadata(
                 it,
                 guardianSummary = summary,
                 status = "completed",
-                preFlight = preFlightAtSessionStart
+                preFlight = preFlightAtSessionStart,
+                events = events
             )
         }
         sessionRef.set(null)
@@ -314,6 +404,7 @@ fun DataCollectionScreen(
             currentSession = session
             sessionRef.set(session)
             preFlightAtSessionStart = snapshot
+            eventLogger.beginSession()
 
             sensorLogger.startLogging(session.imuFile)
             guardian.start()
@@ -345,7 +436,8 @@ fun DataCollectionScreen(
                                         it,
                                         failedSummary,
                                         status = "error",
-                                        preFlight = preFlightAtSessionStart
+                                        preFlight = preFlightAtSessionStart,
+                                        events = eventLogger.endSession()
                                     )
                                 }
                             } catch (_: Exception) {
@@ -365,6 +457,7 @@ fun DataCollectionScreen(
             recError = e.message
             guardian.stop()
             sensorLogger.stopLogging()
+            eventLogger.endSession()
             isRecording = false
             onKeepScreenOn(false)
             Toast.makeText(context, "Failed to start: ${e.message}", Toast.LENGTH_LONG).show()
@@ -395,11 +488,21 @@ fun DataCollectionScreen(
             isHandVisible = isHandVisible,
             analyzedFrameCount = analyzedFrameCount,
             recError = recError,
+            eventFlash = eventFlash,
             modifier = Modifier
                 .fillMaxWidth()
                 .statusBarsPadding()
                 .padding(16.dp)
         )
+
+        if (isRecording) {
+            MarkEventButton(
+                onMark = { eventLogger.record(SessionEvent.MARK) },
+                modifier = Modifier
+                    .align(Alignment.CenterStart)
+                    .padding(start = 16.dp)
+            )
+        }
 
         SessionControlPanel(
             isRecording = isRecording,
@@ -453,6 +556,7 @@ private fun CollectionHud(
     isHandVisible: Boolean,
     analyzedFrameCount: Int,
     recError: String?,
+    eventFlash: EventFlash?,
     modifier: Modifier = Modifier
 ) {
     Column(
@@ -481,6 +585,46 @@ private fun CollectionHud(
                     .padding(horizontal = 12.dp, vertical = 6.dp)
             )
         }
+        eventFlash?.let { flash ->
+            val color = when (flash.eventType) {
+                SessionEvent.SUCCESS -> Color(0xFF2E7D32)
+                SessionEvent.FAILURE -> Color(0xFFC62828)
+                else -> Color(0xFF1565C0)
+            }
+            Text(
+                text = flash.message,
+                color = Color.White,
+                fontWeight = FontWeight.Bold,
+                fontSize = 16.sp,
+                modifier = Modifier
+                    .align(Alignment.CenterHorizontally)
+                    .clip(RoundedCornerShape(10.dp))
+                    .background(color.copy(alpha = 0.92f))
+                    .padding(horizontal = 16.dp, vertical = 8.dp)
+            )
+        }
+    }
+}
+
+@Composable
+private fun MarkEventButton(
+    onMark: () -> Unit,
+    modifier: Modifier = Modifier
+) {
+    Surface(
+        onClick = onMark,
+        modifier = modifier,
+        shape = RoundedCornerShape(18.dp),
+        color = Color(0xCC111111),
+        tonalElevation = 4.dp
+    ) {
+        Text(
+            text = "[ 📍 MARK ]",
+            color = Color.White,
+            fontWeight = FontWeight.Bold,
+            fontSize = 13.sp,
+            modifier = Modifier.padding(horizontal = 12.dp, vertical = 10.dp)
+        )
     }
 }
 
@@ -861,16 +1005,18 @@ private fun writeSessionMetadata(
     session: SessionFiles,
     guardian: DataCollectionGuardian,
     status: String,
-    preFlight: PreFlightReport?
+    preFlight: PreFlightReport?,
+    events: List<SessionEvent>
 ) {
-    writeSessionMetadata(session, guardian.snapshotSummary(), status, preFlight)
+    writeSessionMetadata(session, guardian.snapshotSummary(), status, preFlight, events)
 }
 
 private fun writeSessionMetadata(
     session: SessionFiles,
     guardianSummary: MetadataManager.GuardianSummary,
     status: String,
-    preFlight: PreFlightReport?
+    preFlight: PreFlightReport?,
+    events: List<SessionEvent>
 ) {
     val endNs = SystemClock.elapsedRealtimeNanos()
     MetadataManager.write(
@@ -883,6 +1029,7 @@ private fun writeSessionMetadata(
             imuFile = session.imuFile.name,
             guardianSummary = guardianSummary,
             preFlightStatus = preFlight,
+            events = events,
             status = status
         )
     )
