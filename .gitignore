@@ -1,15 +1,62 @@
-*.iml
-.gradle
-/local.properties
-/.idea/caches
-/.idea/libraries
-/.idea/modules.xml
-/.idea/workspace.xml
-/.idea/navEditor.xml
-/.idea/assetWizardSettings.xml
-.DS_Store
-/build
-/captures
-.externalNativeBuild
-.cxx
+# Gradle
+.gradle/
+build/
+**/build/
+.kotlin/
+
+# Local SDK / machine config
 local.properties
+*.iml
+
+# Android Studio / IntelliJ
+.idea/
+*.ipr
+*.iws
+
+# Keep shared IDE code style if you later commit it:
+# !.idea/codeStyles/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Android build artifacts
+*.apk
+*.aar
+*.aab
+*.ap_
+*.dex
+*.class
+bin/
+gen/
+out/
+.externalNativeBuild/
+.cxx/
+captures/
+output.json
+*.hprof
+
+# Signing (never commit secrets)
+*.jks
+*.keystore
+keystore.properties
+google-services.json
+
+# NDK / CMake
+obj/
+
+# Kotlin / Java
+*.log
+hs_err_pid*
+replay_pid*
+
+# MediaPipe Hands model (download with: ./gradlew :app:downloadHandLandmarkerModel)
+app/src/main/assets/*.task
+
+# Captured sessions if copied into the repo
+**/session_*/
+*.mp4
+imu_data.csv
+quality.jsonl
+manifest.json
+segments.json
