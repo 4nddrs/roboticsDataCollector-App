@@ -62,6 +62,22 @@ class VideoRecorder {
 
     fun isActive(): Boolean = recording != null && !finalized.get()
 
+    fun pause() {
+        try {
+            recording?.pause()
+        } catch (e: Exception) {
+            Log.w(TAG, "pause failed", e)
+        }
+    }
+
+    fun resume() {
+        try {
+            recording?.resume()
+        } catch (e: Exception) {
+            Log.w(TAG, "resume failed", e)
+        }
+    }
+
     companion object {
         private const val TAG = "VideoRecorder"
     }

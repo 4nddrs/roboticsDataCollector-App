@@ -45,6 +45,11 @@ class SensorDataManager(context: Context) : SensorEventListener {
     private var writerJob: Job? = null
     private var ioScope: CoroutineScope? = null
     @Volatile private var activeWriter: BufferedWriter? = null
+    private val paused = AtomicBoolean(false)
+    private val gapCount = java.util.concurrent.atomic.AtomicInteger(0)
+    private val lastSampleNs = java.util.concurrent.atomic.AtomicLong(0L)
+
+    val sensorGapCount: Int get() = gapCount.get()
 
     val activeDevices: List<String>
         get() = buildList {
@@ -116,6 +121,9 @@ class SensorDataManager(context: Context) : SensorEventListener {
         val handler = Handler(thread.looper)
         sensorHandler = handler
         logging.set(true)
+        paused.set(false)
+        gapCount.set(0)
+        lastSampleNs.set(0L)
 
         accelerometer?.let {
             sensorManager.registerListener(this, it, SensorManager.SENSOR_DELAY_FASTEST, handler)
@@ -178,13 +186,26 @@ class SensorDataManager(context: Context) : SensorEventListener {
         }
     }
 
+    fun pauseLogging() {
+        paused.set(true)
+    }
+
+    fun resumeLogging() {
+        lastSampleNs.set(0L)
+        paused.set(false)
+    }
+
     fun forceFlushAndClose() = stopLogging()
 
     fun release() = stopLogging()
 
     override fun onSensorChanged(event: SensorEvent?) {
-        if (!logging.get() || event == null) return
+        if (!logging.get() || paused.get() || event == null) return
         val timestampNs = SystemClock.elapsedRealtimeNanos()
+        val previous = lastSampleNs.getAndSet(timestampNs)
+        if (previous > 0L && timestampNs - previous > IMU_GAP_NS) {
+            gapCount.incrementAndGet()
+        }
         val type = when (event.sensor.type) {
             Sensor.TYPE_ACCELEROMETER -> "ACCEL"
             Sensor.TYPE_GYROSCOPE -> "GYRO"
@@ -204,5 +225,6 @@ class SensorDataManager(context: Context) : SensorEventListener {
         private const val CSV_HEADER = "timestamp_ns,sensor_type,x,y,z"
         private const val BUFFER_SIZE = 64 * 1024
         private const val FLUSH_EVERY_SAMPLES = 100
+        private const val IMU_GAP_NS = 50_000_000L
     }
 }

@@ -2,7 +2,10 @@ package com.example.roboticsdatacollector
 
 import android.Manifest
 import android.content.pm.PackageManager
+import android.media.MediaMetadataRetriever
+import android.os.Build
 import android.os.Bundle
+import android.os.PowerManager
 import android.os.SystemClock
 import android.util.Log
 import android.view.KeyEvent
@@ -17,6 +20,9 @@ import androidx.activity.enableEdgeToEdge
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.camera.core.CameraSelector
 import androidx.camera.core.ImageAnalysis
+import androidx.camera.video.FallbackStrategy
+import androidx.camera.video.Quality
+import androidx.camera.video.QualitySelector
 import androidx.camera.video.Recording
 import androidx.camera.video.VideoRecordEvent
 import androidx.camera.view.CameraController
@@ -50,6 +56,7 @@ import androidx.compose.material.icons.filled.FiberManualRecord
 import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material.icons.filled.Stop
 import androidx.compose.material.icons.filled.VideocamOff
+import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.Card
@@ -67,7 +74,9 @@ import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableLongStateOf
+import androidx.compose.runtime.mutableStateListOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
@@ -87,6 +96,7 @@ import androidx.lifecycle.compose.LocalLifecycleOwner
 import com.example.roboticsdatacollector.ui.theme.RoboticsDataCollectorTheme
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.collect
+import org.json.JSONObject
 import java.io.File
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
@@ -157,7 +167,7 @@ class MainActivity : ComponentActivity() {
     }
 
     override fun onKeyDown(keyCode: Int, event: KeyEvent): Boolean {
-        if (!eventLogger.isRecording) return super.onKeyDown(keyCode, event)
+        if (!eventLogger.isCapturing) return super.onKeyDown(keyCode, event)
         return when (keyCode) {
             KeyEvent.KEYCODE_VOLUME_UP -> {
                 if (event.repeatCount == 0) {
@@ -185,7 +195,7 @@ class MainActivity : ComponentActivity() {
     }
 
     override fun onKeyUp(keyCode: Int, event: KeyEvent): Boolean {
-        if (!eventLogger.isRecording) return super.onKeyUp(keyCode, event)
+        if (!eventLogger.isCapturing) return super.onKeyUp(keyCode, event)
         return when (keyCode) {
             KeyEvent.KEYCODE_VOLUME_UP -> true
             KeyEvent.KEYCODE_VOLUME_DOWN -> {
@@ -256,12 +266,19 @@ class MainActivity : ComponentActivity() {
     }
 }
 
+private const val SEGMENT_DURATION_MS = 10L * 60L * 1000L
+private const val LOW_STORAGE_WARN_BYTES = 1024L * 1024L * 1024L
+private const val LOW_STORAGE_STOP_BYTES = 500L * 1024L * 1024L
+
 private enum class AppScreen { Capture, Sessions }
 
-private val REQUIRED_PERMISSIONS = arrayOf(
-    Manifest.permission.CAMERA,
-    Manifest.permission.RECORD_AUDIO
-)
+private val REQUIRED_PERMISSIONS = buildList {
+    add(Manifest.permission.CAMERA)
+    add(Manifest.permission.RECORD_AUDIO)
+    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+        add(Manifest.permission.POST_NOTIFICATIONS)
+    }
+}.toTypedArray()
 
 @Composable
 fun DataCollectionScreen(
@@ -326,16 +343,21 @@ fun DataCollectionScreen(
     }
 
     var isRecording by remember { mutableStateOf(false) }
+    var isPaused by remember { mutableStateOf(false) }
     var recError by remember { mutableStateOf<String?>(null) }
     var safetyBanner by remember { mutableStateOf<String?>(null) }
     var activeRecording by remember { mutableStateOf<Recording?>(null) }
     var currentSession by remember { mutableStateOf<SessionFiles?>(null) }
     val recordingRef = remember { AtomicReference<Recording?>(null) }
     val sessionRef = remember { AtomicReference<SessionFiles?>(null) }
+    val rotateSegmentRef = remember { AtomicReference<(() -> Unit)?>(null) }
     val sessionClosing = remember { AtomicBoolean(false) }
     val stopSessionRef = remember { AtomicReference<((String) -> Unit)?>(null) }
 
     val isHandVisible by guardian.isHandVisible.collectAsState()
+    val handState by guardian.handState.collectAsState()
+    val workspaceVisible by guardian.workspaceVisible.collectAsState()
+    val visibilityClass by guardian.visibilityClass.collectAsState()
     val analyzedFrameCount by guardian.analyzedFrameCount.collectAsState()
     val qualityWarning by guardian.qualityWarning.collectAsState()
     val eventFlash by eventLogger.flash.collectAsState()
@@ -354,23 +376,41 @@ fun DataCollectionScreen(
     }
 
     var elapsedMs by remember { mutableLongStateOf(0L) }
-    LaunchedEffect(isRecording) {
+    LaunchedEffect(isRecording, isPaused) {
         if (!isRecording) {
             elapsedMs = 0L
             return@LaunchedEffect
         }
+        if (isPaused) return@LaunchedEffect
+        val base = elapsedMs
         val startedAt = SystemClock.elapsedRealtime()
         while (true) {
-            elapsedMs = SystemClock.elapsedRealtime() - startedAt
+            elapsedMs = base + (SystemClock.elapsedRealtime() - startedAt)
             delay(200)
         }
     }
+
+    var phase by remember { mutableStateOf(CollectionPhase.SETUP) }
+    var sessionConfig by remember { mutableStateOf(SessionConfig()) }
+    var lastReport by remember { mutableStateOf<SessionReport?>(null) }
+    var orphanSession by remember { mutableStateOf<SessionRecord?>(null) }
+    var storageHud by remember { mutableStateOf("Storage ✓") }
+    var segmentIndex by remember { mutableIntStateOf(0) }
+    val videoSegments = remember { mutableStateListOf<VideoSegment>() }
+    val pauseIntervals = remember { mutableStateListOf<Pair<Long, Long>>() }
+    var pauseStartedNs by remember { mutableLongStateOf(0L) }
+    val qualityLogger = remember { QualityLogger() }
+    val sessionRepository = remember { SessionRepository(context) }
 
     val cameraController = remember {
         LifecycleCameraController(context).apply {
             cameraSelector = CameraSelector.DEFAULT_BACK_CAMERA
             setEnabledUseCases(
                 CameraController.VIDEO_CAPTURE or CameraController.IMAGE_ANALYSIS
+            )
+            videoCaptureQualitySelector = QualitySelector.fromOrderedList(
+                listOf(Quality.FHD, Quality.HD, Quality.SD),
+                FallbackStrategy.lowerQualityOrHigherThan(Quality.HD)
             )
             imageAnalysisBackpressureStrategy = ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST
             setImageAnalysisAnalyzer(analysisExecutor, guardian)
@@ -410,9 +450,14 @@ fun DataCollectionScreen(
                     guardian,
                     status = SessionStatus.INTERRUPTED_SYSTEM,
                     preFlight = preFlightAtSessionStart,
-                    events = eventLogger.endSession()
+                    events = eventLogger.endSession(),
+                    config = sessionConfig,
+                    segments = videoSegments.toList(),
+                    pauseIntervals = pauseIntervals.toList()
                 )
             }
+            qualityLogger.stop()
+            CollectionForegroundService.stop(context)
             guardian.stop()
             sensorDataManager.forceFlushAndClose()
             onKeepScreenOn(false)
@@ -424,6 +469,8 @@ fun DataCollectionScreen(
             val (status, message) = when (reason) {
                 SessionProtectReason.LOW_BATTERY ->
                     SessionStatus.INTERRUPTED_LOW_BATTERY to "Critical battery: Saving session..."
+                SessionProtectReason.LOW_STORAGE ->
+                    SessionStatus.INTERRUPTED_LOW_STORAGE to "Low storage: Saving session..."
                 SessionProtectReason.SYSTEM ->
                     SessionStatus.INTERRUPTED_SYSTEM to "System interrupt: Saving session..."
             }
@@ -433,36 +480,230 @@ fun DataCollectionScreen(
         }
     }
 
+    LaunchedEffect(Unit) {
+        orphanSession = sessionRepository.orphanSessions().firstOrNull()
+    }
+
+    DisposableEffect(guardian, context) {
+        guardian.onHandsOutEscalation = { eventLogger.notifyHandsOut() }
+        guardian.onQualitySample = { json ->
+            json.put("thermal_status", DeviceHealth.thermalStatus(context))
+            val dir = sessionRef.get()?.dir ?: context.getExternalFilesDir(null) ?: context.filesDir
+            json.put("free_bytes", DeviceHealth.freeBytes(dir))
+            json.put("sensor_gaps", sensorDataManager.sensorGapCount)
+            qualityLogger.append(json)
+        }
+        onDispose {
+            guardian.onHandsOutEscalation = null
+            guardian.onQualitySample = null
+        }
+    }
+
+    LaunchedEffect(phase) {
+        if (phase == CollectionPhase.WAITING_FOR_WEAR && !isRecording) {
+            guardian.start()
+        }
+    }
+
+    LaunchedEffect(isRecording, isPaused, currentSession) {
+        val session = currentSession
+        if (!isRecording || session == null) return@LaunchedEffect
+        var severeHaptic = false
+        while (isRecording) {
+            val free = DeviceHealth.freeBytes(session.dir)
+            storageHud = when {
+                free < LOW_STORAGE_STOP_BYTES -> "Storage 🔴"
+                free < LOW_STORAGE_WARN_BYTES -> "Storage 🟡"
+                else -> "Storage ✓"
+            }
+            if (free in 1 until LOW_STORAGE_STOP_BYTES) {
+                eventLogger.notifyCritical()
+                stopSessionRef.get()?.invoke(SessionStatus.INTERRUPTED_LOW_STORAGE)
+                return@LaunchedEffect
+            }
+            val thermal = DeviceHealth.thermalStatus(context)
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q &&
+                thermal >= PowerManager.THERMAL_STATUS_SEVERE &&
+                !severeHaptic
+            ) {
+                severeHaptic = true
+                eventLogger.notifyCritical()
+                safetyBanner = "Device hot — collection continues"
+            }
+            delay(15_000)
+        }
+    }
+
+    LaunchedEffect(isRecording, isPaused) {
+        if (!isRecording || isPaused) return@LaunchedEffect
+        delay(SEGMENT_DURATION_MS)
+        while (isRecording && !isPaused) {
+            rotateSegmentRef.get()?.invoke()
+            delay(SEGMENT_DURATION_MS)
+        }
+    }
+
+    fun closeCurrentSegment() {
+        val now = SystemClock.elapsedRealtimeNanos()
+        if (videoSegments.isNotEmpty()) {
+            videoSegments[videoSegments.lastIndex] =
+                videoSegments.last().copy(endTimestampNs = now)
+        }
+        videoRecorder.forceFinalize()
+        currentSession?.let { SegmentsWriter.write(it.dir, videoSegments.toList()) }
+    }
+
+    fun startVideoSegment(session: SessionFiles, index: Int) {
+        val file = session.videoFile(index)
+        val startNs = SystemClock.elapsedRealtimeNanos()
+        videoSegments.add(
+            VideoSegment(index = index, fileName = file.name, startTimestampNs = startNs)
+        )
+        val mainExecutor = ContextCompat.getMainExecutor(context)
+        activeRecording = videoRecorder.start(
+            controller = cameraController,
+            outputFile = file,
+            executor = mainExecutor
+        ) { event ->
+            when (event) {
+                is VideoRecordEvent.Start -> {
+                    isRecording = true
+                    onKeepScreenOn(true)
+                }
+                is VideoRecordEvent.Finalize -> {
+                    if (event.hasError() && isRecording && !sessionClosing.get()) {
+                        recError = event.cause?.message ?: "Recording error"
+                        Log.e("DataCollection", "Finalize error: ${event.error}", event.cause)
+                    }
+                }
+            }
+        }
+        recordingRef.set(activeRecording)
+        SegmentsWriter.write(session.dir, videoSegments.toList())
+    }
+
+    fun rotateVideoSegment() {
+        val session = currentSession ?: return
+        if (!isRecording || isPaused) return
+        closeCurrentSegment()
+        segmentIndex += 1
+        startVideoSegment(session, segmentIndex)
+    }
+    rotateSegmentRef.set { rotateVideoSegment() }
+
+    fun pauseCapture() {
+        if (!isRecording || isPaused) return
+        closeCurrentSegment()
+        sensorDataManager.pauseLogging()
+        eventLogger.setPaused(true)
+        isPaused = true
+        pauseStartedNs = SystemClock.elapsedRealtimeNanos()
+        phase = CollectionPhase.PAUSED
+        currentSession?.let {
+            writeSessionMetadata(
+                it,
+                guardian,
+                status = SessionStatus.PAUSED,
+                preFlight = preFlightAtSessionStart,
+                events = eventLogger.snapshot(),
+                config = sessionConfig,
+                segments = videoSegments.toList(),
+                pauseIntervals = pauseIntervals.toList()
+            )
+        }
+    }
+
+    fun resumeCapture() {
+        val session = currentSession ?: return
+        if (!isPaused) return
+        if (pauseStartedNs > 0L) {
+            pauseIntervals.add(pauseStartedNs to SystemClock.elapsedRealtimeNanos())
+            pauseStartedNs = 0L
+        }
+        sensorDataManager.resumeLogging()
+        eventLogger.setPaused(false)
+        isPaused = false
+        phase = CollectionPhase.COLLECTING
+        segmentIndex += 1
+        startVideoSegment(session, segmentIndex)
+        writeSessionMetadata(
+            session,
+            guardian,
+            status = SessionStatus.RECORDING,
+            preFlight = preFlightAtSessionStart,
+            events = eventLogger.snapshot(),
+            config = sessionConfig,
+            segments = videoSegments.toList(),
+            pauseIntervals = pauseIntervals.toList()
+        )
+    }
+
     fun stopSession(status: String = SessionStatus.COMPLETED) {
         if (!sessionClosing.compareAndSet(false, true)) return
+        phase = CollectionPhase.FINALIZING
         val session = currentSession
         val summary = guardian.snapshotSummary()
         sessionSafety.stopMonitoring()
+        CollectionForegroundService.stop(context)
+        if (isPaused && pauseStartedNs > 0L) {
+            pauseIntervals.add(pauseStartedNs to SystemClock.elapsedRealtimeNanos())
+        }
         try {
-            videoRecorder.forceFinalize()
+            closeCurrentSegment()
         } catch (e: Exception) {
             Log.e("DataCollection", "Failed to stop video", e)
         }
         activeRecording = null
         recordingRef.set(null)
         guardian.stop()
+        qualityLogger.stop()
         sensorDataManager.forceFlushAndClose()
         val events = eventLogger.endSession()
+        eventLogger.notifyStop()
         session?.let {
+            ManifestWriter.writeCalibrationStub(it.dir)
+            val allFiles = it.dir.walkTopDown().filter { file -> file.isFile }.toList()
+            ManifestWriter.write(it.dir, it.sessionId, allFiles)
             writeSessionMetadata(
                 it,
                 guardianSummary = summary,
                 status = status,
                 preFlight = preFlightAtSessionStart,
-                events = events
+                events = events,
+                config = sessionConfig,
+                segments = videoSegments.toList(),
+                pauseIntervals = pauseIntervals.toList(),
+                sensorGaps = sensorDataManager.sensorGapCount
+            )
+            val videoOk = it.dir.listFiles { f -> f.name.endsWith(".mp4") }?.any { f -> f.length() > 0 } == true
+            val imuOk = it.imuFile.exists() && it.imuFile.length() > 0
+            val cameraQuality = (100.0 - summary.blurredFramesPercentage - summary.underexposedFramesPercentage)
+                .coerceIn(0.0, 100.0)
+            lastReport = SessionReport(
+                sessionId = it.sessionId,
+                durationSeconds = (SystemClock.elapsedRealtimeNanos() - it.startTimestampNs) / 1_000_000_000.0,
+                videoSaved = videoOk,
+                imuSaved = imuOk,
+                audioSaved = videoOk,
+                handVisibilityPercent = summary.handsDetectedPercentage,
+                workspaceVisibilityPercent = summary.workspaceVisiblePercentage,
+                cameraQualityPercent = cameraQuality,
+                droppedFrames = summary.droppedFrames,
+                sensorGaps = sensorDataManager.sensorGapCount,
+                storageBytes = it.dir.walkTopDown().filter { f -> f.isFile }.sumOf { f -> f.length() },
+                overall = visibilityClass,
+                status = status
             )
         }
         sessionRef.set(null)
         currentSession = null
         isRecording = false
+        isPaused = false
         onKeepScreenOn(false)
+        phase = CollectionPhase.REPORT
         val savedMessage = when (status) {
             SessionStatus.INTERRUPTED_LOW_BATTERY -> "Critical battery: Session saved"
+            SessionStatus.INTERRUPTED_LOW_STORAGE -> "Low storage: Session saved"
             SessionStatus.INTERRUPTED_SYSTEM -> "Interrupted: Session saved"
             SessionStatus.ERROR -> "Session ended with errors"
             else -> "Session saved"
@@ -473,7 +714,7 @@ fun DataCollectionScreen(
     }
     stopSessionRef.set { status -> stopSession(status) }
 
-    fun startSession() {
+    fun startSession(overrideMount: Boolean = false) {
         recError = null
         safetyBanner = null
         sessionClosing.set(false)
@@ -481,6 +722,7 @@ fun DataCollectionScreen(
         val snapshot = preFlightChecker.evaluate()
         preFlight = snapshot
         if (!snapshot.canStartSession) {
+            phase = CollectionPhase.PRE_FLIGHT
             showPreFlightOverlay = true
             Toast.makeText(
                 context,
@@ -490,11 +732,18 @@ fun DataCollectionScreen(
             return
         }
         try {
-            val session = SessionFiles.create(context.getExternalFilesDir(null))
+            val session = SessionFiles.create(context.getExternalFilesDir(null), sessionConfig)
             currentSession = session
             sessionRef.set(session)
             preFlightAtSessionStart = snapshot
+            videoSegments.clear()
+            pauseIntervals.clear()
+            segmentIndex = 0
+            isPaused = false
             eventLogger.beginSession()
+            eventLogger.notifyStart()
+            qualityLogger.start(session.dir)
+            CollectionForegroundService.start(context)
 
             writeSessionMetadata(
                 session,
@@ -504,49 +753,39 @@ fun DataCollectionScreen(
                 ),
                 status = SessionStatus.RECORDING,
                 preFlight = snapshot,
-                events = emptyList()
+                events = emptyList(),
+                config = sessionConfig,
+                mountOverride = overrideMount
             )
 
             sensorDataManager.startLogging(session.imuFile)
             guardian.start()
             sessionSafety.startMonitoring()
-
-            val mainExecutor = ContextCompat.getMainExecutor(context)
-            activeRecording = videoRecorder.start(
-                controller = cameraController,
-                outputFile = session.videoFile,
-                executor = mainExecutor
-            ) { event ->
-                when (event) {
-                    is VideoRecordEvent.Start -> {
-                        isRecording = true
-                        onKeepScreenOn(true)
-                    }
-                    is VideoRecordEvent.Finalize -> {
-                        if (event.hasError()) {
-                            recError = event.cause?.message ?: "Recording error"
-                            Log.e("DataCollection", "Finalize error: ${event.error}", event.cause)
-                            try {
-                                stopSession(SessionStatus.ERROR)
-                            } catch (_: Exception) {
-                            }
-                        }
-                    }
-                }
+            cameraController.videoCaptureQualitySelector = if (sessionConfig.profile == RecordingProfile.ENDURANCE) {
+                QualitySelector.from(Quality.HD)
+            } else {
+                QualitySelector.fromOrderedList(
+                    listOf(Quality.FHD, Quality.HD, Quality.SD),
+                    FallbackStrategy.lowerQualityOrHigherThan(Quality.HD)
+                )
             }
-            recordingRef.set(activeRecording)
+            startVideoSegment(session, 0)
             isRecording = true
+            phase = CollectionPhase.COLLECTING
             onKeepScreenOn(true)
             Toast.makeText(context, "Session started: ${session.sessionId}", Toast.LENGTH_SHORT).show()
         } catch (e: Exception) {
             Log.e("DataCollection", "Failed to start session", e)
             recError = e.message
             sessionSafety.stopMonitoring()
+            CollectionForegroundService.stop(context)
             guardian.stop()
+            qualityLogger.stop()
             sensorDataManager.forceFlushAndClose()
             videoRecorder.forceFinalize()
             eventLogger.endSession()
             isRecording = false
+            phase = CollectionPhase.WAITING_FOR_WEAR
             onKeepScreenOn(false)
             Toast.makeText(context, "Failed to start: ${e.message}", Toast.LENGTH_LONG).show()
         }
@@ -572,9 +811,12 @@ fun DataCollectionScreen(
 
         CollectionHud(
             isRecording = isRecording,
+            isPaused = isPaused,
             elapsedMs = elapsedMs,
-            isHandVisible = isHandVisible,
-            analyzedFrameCount = analyzedFrameCount,
+            handState = handState,
+            workspaceVisible = workspaceVisible,
+            visibilityClass = visibilityClass,
+            storageHud = storageHud,
             recError = recError,
             eventFlash = eventFlash,
             qualityWarning = qualityWarning,
@@ -585,7 +827,7 @@ fun DataCollectionScreen(
                 .padding(16.dp)
         )
 
-        if (isRecording) {
+        if (isRecording && !isPaused) {
             MarkEventButton(
                 onMark = { eventLogger.record(SessionEvent.MARK) },
                 modifier = Modifier
@@ -594,50 +836,90 @@ fun DataCollectionScreen(
             )
         }
 
-        SessionControlPanel(
-            isRecording = isRecording,
-            startEnabled = preFlight.canStartSession,
-            onToggle = {
-                if (isRecording) {
-                    stopSession()
-                    return@SessionControlPanel
-                }
-                if (!preFlight.canStartSession) {
-                    showPreFlightOverlay = true
-                    if (!preFlight.permissionsPassed) {
-                        permissionLauncher.launch(REQUIRED_PERMISSIONS)
-                    } else {
-                        refreshPreFlight()
-                    }
-                    return@SessionControlPanel
-                }
-                startSession()
-            },
-            modifier = Modifier
-                .align(Alignment.BottomCenter)
-                .navigationBarsPadding()
-                .padding(horizontal = 20.dp, vertical = 20.dp)
-        )
+        if (isRecording) {
+            CollectingControlPanel(
+                isPaused = isPaused,
+                onPause = { pauseCapture() },
+                onResume = { resumeCapture() },
+                onStop = { stopSession() },
+                modifier = Modifier
+                    .align(Alignment.BottomCenter)
+                    .navigationBarsPadding()
+                    .padding(horizontal = 20.dp, vertical = 20.dp)
+            )
+        }
 
-        if (showPreFlightOverlay && !isRecording) {
+        if (phase == CollectionPhase.SETUP && !isRecording) {
+            SessionSetupOverlay(
+                config = sessionConfig,
+                onConfigChange = { sessionConfig = it },
+                onContinue = {
+                    phase = CollectionPhase.PRE_FLIGHT
+                    showPreFlightOverlay = true
+                    refreshPreFlight()
+                }
+            )
+        }
+
+        if (phase == CollectionPhase.PRE_FLIGHT && showPreFlightOverlay && !isRecording) {
             PreFlightOverlay(
                 report = preFlight,
                 onRefresh = { refreshPreFlight() },
                 onRequestPermissions = { permissionLauncher.launch(REQUIRED_PERMISSIONS) },
-                onContinue = { showPreFlightOverlay = false }
-            )
-        } else if (!isRecording) {
-            PreFlightCompactBar(
-                report = preFlight,
-                onOpen = { showPreFlightOverlay = true },
-                modifier = Modifier
-                    .align(Alignment.BottomCenter)
-                    .navigationBarsPadding()
-                    .padding(start = 20.dp, end = 20.dp, bottom = 118.dp)
+                onContinue = {
+                    showPreFlightOverlay = false
+                    phase = CollectionPhase.WAITING_FOR_WEAR
+                }
             )
         }
 
-        if (!isRecording) {
+        if (phase == CollectionPhase.WAITING_FOR_WEAR && !isRecording) {
+            val mountReady = workspaceVisible && handState != HandVisibilityState.NONE
+            MountingCheckOverlay(
+                handState = handState,
+                workspaceVisible = workspaceVisible,
+                canStart = preFlight.canStartSession && mountReady,
+                onStart = { startSession(overrideMount = false) },
+                onOverride = { startSession(overrideMount = true) }
+            )
+        }
+
+        lastReport?.let { report ->
+            if (phase == CollectionPhase.REPORT) {
+                SessionReportOverlay(
+                    report = report,
+                    onDone = {
+                        lastReport = null
+                        phase = CollectionPhase.SETUP
+                    }
+                )
+            }
+        }
+
+        orphanSession?.let { orphan ->
+            AlertDialog(
+                onDismissRequest = { },
+                title = { Text("Unfinished session") },
+                text = {
+                    RecoveryDialogContent(
+                        sessionId = orphan.sessionId,
+                        onRecover = {
+                            sessionRepository.recoverSession(orphan)
+                            orphanSession = null
+                            Toast.makeText(context, "Session recovered", Toast.LENGTH_SHORT).show()
+                        },
+                        onDiscard = {
+                            sessionRepository.deleteSession(orphan)
+                            orphanSession = null
+                            Toast.makeText(context, "Session discarded", Toast.LENGTH_SHORT).show()
+                        }
+                    )
+                },
+                confirmButton = {}
+            )
+        }
+
+        if (!isRecording && phase != CollectionPhase.SETUP && phase != CollectionPhase.REPORT) {
             Surface(
                 onClick = onOpenSessions,
                 shape = RoundedCornerShape(20.dp),
@@ -661,7 +943,7 @@ fun DataCollectionScreen(
                     Text(
                         text = "Sessions",
                         color = Color.White,
-                        fontWeight = FontWeight.SemiBold,
+                        fontWeight = FontWeight.Bold,
                         fontSize = 12.sp
                     )
                 }
@@ -673,9 +955,12 @@ fun DataCollectionScreen(
 @Composable
 private fun CollectionHud(
     isRecording: Boolean,
+    isPaused: Boolean,
     elapsedMs: Long,
-    isHandVisible: Boolean,
-    analyzedFrameCount: Int,
+    handState: HandVisibilityState,
+    workspaceVisible: Boolean,
+    visibilityClass: VisibilityClass,
+    storageHud: String,
     recError: String?,
     eventFlash: EventFlash?,
     qualityWarning: QualityWarning,
@@ -684,18 +969,24 @@ private fun CollectionHud(
 ) {
     Column(
         modifier = modifier,
-        verticalArrangement = Arrangement.spacedBy(10.dp)
+        verticalArrangement = Arrangement.spacedBy(8.dp)
     ) {
         Row(
             modifier = Modifier.fillMaxWidth(),
             horizontalArrangement = Arrangement.SpaceBetween,
             verticalAlignment = Alignment.Top
         ) {
-            RecTimerBadge(isRecording = isRecording, elapsedMs = elapsedMs)
-            GuardianStatusBadge(
-                isHandVisible = isHandVisible,
-                analyzedFrameCount = analyzedFrameCount,
-                sessionActive = isRecording
+            RecTimerBadge(
+                isRecording = isRecording && !isPaused,
+                elapsedMs = elapsedMs,
+                paused = isPaused
+            )
+            QuietStatusStrip(
+                isRecording = isRecording,
+                handState = handState,
+                workspaceVisible = workspaceVisible,
+                visibilityClass = visibilityClass,
+                storageHud = storageHud
             )
         }
         safetyBanner?.let { msg ->
@@ -711,7 +1002,7 @@ private fun CollectionHud(
                     .padding(horizontal = 16.dp, vertical = 8.dp)
             )
         }
-        if (isRecording && qualityWarning.kind != QualityWarningKind.NONE && qualityWarning.message != null) {
+        if (isRecording && !isPaused && qualityWarning.kind != QualityWarningKind.NONE && qualityWarning.message != null) {
             Text(
                 text = qualityWarning.message,
                 color = Color.White,
@@ -778,7 +1069,7 @@ private fun MarkEventButton(
 }
 
 @Composable
-private fun RecTimerBadge(isRecording: Boolean, elapsedMs: Long) {
+private fun RecTimerBadge(isRecording: Boolean, elapsedMs: Long, paused: Boolean = false) {
     val alpha by rememberInfiniteTransition(label = "rec-blink").animateFloat(
         initialValue = 1f,
         targetValue = if (isRecording) 0.25f else 1f,
@@ -806,7 +1097,11 @@ private fun RecTimerBadge(isRecording: Boolean, elapsedMs: Long) {
                 )
         )
         Text(
-            text = if (isRecording) "REC  ${formatMmSs(elapsedMs)}" else "STANDBY",
+            text = when {
+                paused -> "PAUSE  ${formatMmSs(elapsedMs)}"
+                isRecording -> "REC  ${formatMmSs(elapsedMs)}"
+                else -> "STANDBY"
+            },
             color = Color.White,
             fontWeight = FontWeight.Bold,
             fontSize = 13.sp,
@@ -816,27 +1111,31 @@ private fun RecTimerBadge(isRecording: Boolean, elapsedMs: Long) {
 }
 
 @Composable
-private fun GuardianStatusBadge(
-    isHandVisible: Boolean,
-    analyzedFrameCount: Int,
-    sessionActive: Boolean
+private fun QuietStatusStrip(
+    isRecording: Boolean,
+    handState: HandVisibilityState,
+    workspaceVisible: Boolean,
+    visibilityClass: VisibilityClass,
+    storageHud: String
 ) {
-    val label = when {
-        !sessionActive -> "Guardian idle"
-        isHandVisible -> "Hands Detected"
-        else -> "No Hands"
+    val handsLabel = when (handState) {
+        HandVisibilityState.BOTH -> "Hands ✓"
+        HandVisibilityState.LEFT -> "Hands L"
+        HandVisibilityState.RIGHT -> "Hands R"
+        HandVisibilityState.PARTIAL -> "Hands ~"
+        HandVisibilityState.NONE -> "Hands ✕"
+    }
+    val camLabel = when (visibilityClass) {
+        VisibilityClass.GOOD -> "Cam ✓"
+        VisibilityClass.DEGRADED -> "Cam ~"
+        VisibilityClass.POOR -> "Cam ✕"
     }
     val color = when {
-        !sessionActive -> Color(0xFF9E9E9E)
-        isHandVisible -> Color(0xFF2E7D32)
+        !isRecording -> Color(0xFF9E9E9E)
+        visibilityClass == VisibilityClass.GOOD && handState != HandVisibilityState.NONE -> Color(0xFF2E7D32)
+        visibilityClass == VisibilityClass.POOR || handState == HandVisibilityState.NONE -> Color(0xFFF9A825)
         else -> Color(0xFFF9A825)
     }
-    val prefix = when {
-        !sessionActive -> ""
-        isHandVisible -> "🖐️ "
-        else -> "⚠️ "
-    }
-
     Column(
         modifier = Modifier
             .clip(RoundedCornerShape(16.dp))
@@ -844,29 +1143,54 @@ private fun GuardianStatusBadge(
             .padding(horizontal = 12.dp, vertical = 8.dp),
         horizontalAlignment = Alignment.End
     ) {
+        Text(
+            text = "$handsLabel  $camLabel  $storageHud",
+            color = Color.White,
+            fontWeight = FontWeight.SemiBold,
+            fontSize = 12.sp
+        )
+        Text(
+            text = if (workspaceVisible) "Workspace ✓" else "Workspace ✕",
+            color = color,
+            fontSize = 10.sp
+        )
+    }
+}
+
+@Composable
+private fun CollectingControlPanel(
+    isPaused: Boolean,
+    onPause: () -> Unit,
+    onResume: () -> Unit,
+    onStop: () -> Unit,
+    modifier: Modifier = Modifier
+) {
+    Surface(
+        modifier = modifier.fillMaxWidth(),
+        shape = RoundedCornerShape(28.dp),
+        color = Color(0xD9111111),
+        tonalElevation = 6.dp,
+        shadowElevation = 8.dp
+    ) {
         Row(
-            verticalAlignment = Alignment.CenterVertically,
-            horizontalArrangement = Arrangement.spacedBy(8.dp)
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(horizontal = 16.dp, vertical = 14.dp),
+            horizontalArrangement = Arrangement.spacedBy(10.dp)
         ) {
-            Box(
-                modifier = Modifier
-                    .size(10.dp)
-                    .clip(CircleShape)
-                    .background(color)
-            )
-            Text(
-                text = "$prefix$label",
-                color = Color.White,
-                fontWeight = FontWeight.SemiBold,
-                fontSize = 12.sp
-            )
-        }
-        if (sessionActive) {
-            Text(
-                text = "frames: $analyzedFrameCount",
-                color = Color(0xFFBDBDBD),
-                fontSize = 10.sp
-            )
+            OutlinedButton(
+                onClick = if (isPaused) onResume else onPause,
+                modifier = Modifier.weight(1f)
+            ) {
+                Text(if (isPaused) "RESUME" else "PAUSE")
+            }
+            Button(
+                onClick = onStop,
+                modifier = Modifier.weight(1f),
+                colors = ButtonDefaults.buttonColors(containerColor = Color(0xFFC62828))
+            ) {
+                Text("STOP")
+            }
         }
     }
 }
@@ -973,6 +1297,8 @@ private fun PreFlightOverlay(
                     PreFlightRow("Battery Status", report.batteryDetail, report.batteryPassed)
                     PreFlightRow("IMU Sensors", report.sensorsDetail, report.sensorsPassed)
                     PreFlightRow("Hardware Permissions", report.permissionsDetail, report.permissionsPassed)
+                    PreFlightRow("Thermal", report.thermalDetail, report.thermalPassed)
+                    PreFlightRow("Timestamps", report.timestampDetail, report.timestampOk)
                 }
                 Row(
                     modifier = Modifier.fillMaxWidth(),
@@ -1123,29 +1449,37 @@ private fun PermissionDeniedPane(onRequest: () -> Unit) {
 private data class SessionFiles(
     val sessionId: String,
     val dir: File,
-    val videoFile: File,
     val imuFile: File,
     val metadataFile: File,
     val startTimestampNs: Long
 ) {
+    fun videoFile(index: Int): File = File(dir, "video_%03d.mp4".format(index))
+
     companion object {
-        fun create(filesDir: File?): SessionFiles {
+        fun create(filesDir: File?, config: SessionConfig): SessionFiles {
             val root = filesDir ?: throw IllegalStateException("App storage is not available")
             val startedAtMs = System.currentTimeMillis()
             val startNs = SystemClock.elapsedRealtimeNanos()
             val sessionId = "session_$startedAtMs"
-            val dir = File(root, sessionId)
+            val experiment = sanitizePath(config.experiment)
+            val participant = sanitizePath(config.participantId)
+            val dir = File(root, "$experiment/$participant/$sessionId")
             if (!dir.mkdirs() && !dir.isDirectory) {
                 throw IllegalStateException("Could not create $dir")
             }
             return SessionFiles(
                 sessionId = sessionId,
                 dir = dir,
-                videoFile = File(dir, "video.mp4"),
                 imuFile = File(dir, "imu_data.csv"),
                 metadataFile = File(dir, "metadata.json"),
                 startTimestampNs = startNs
             )
+        }
+
+        private fun sanitizePath(value: String): String {
+            val cleaned = value.trim().ifBlank { "unknown" }
+                .replace(Regex("[^A-Za-z0-9._-]"), "_")
+            return cleaned.take(48)
         }
     }
 }
@@ -1155,9 +1489,24 @@ private fun writeSessionMetadata(
     guardian: DataCollectionGuardian,
     status: String,
     preFlight: PreFlightReport?,
-    events: List<SessionEvent>
+    events: List<SessionEvent>,
+    config: SessionConfig? = null,
+    segments: List<VideoSegment> = emptyList(),
+    pauseIntervals: List<Pair<Long, Long>> = emptyList(),
+    mountOverride: Boolean = false
 ) {
-    writeSessionMetadata(session, guardian.snapshotSummary(), status, preFlight, events)
+    writeSessionMetadata(
+        session,
+        guardian.snapshotSummary(),
+        status,
+        preFlight,
+        events,
+        config,
+        segments,
+        pauseIntervals,
+        sensorGaps = 0,
+        mountOverride = mountOverride
+    )
 }
 
 private fun writeSessionMetadata(
@@ -1165,23 +1514,63 @@ private fun writeSessionMetadata(
     guardianSummary: MetadataManager.GuardianSummary,
     status: String,
     preFlight: PreFlightReport?,
-    events: List<SessionEvent>
+    events: List<SessionEvent>,
+    config: SessionConfig? = null,
+    segments: List<VideoSegment> = emptyList(),
+    pauseIntervals: List<Pair<Long, Long>> = emptyList(),
+    sensorGaps: Int = 0,
+    mountOverride: Boolean = false
 ) {
     val endNs = SystemClock.elapsedRealtimeNanos()
+    val videoNames = segments.map { it.fileName }.ifEmpty {
+        listOf("video_000.mp4")
+    }
+    val size = probeVideoSize(File(session.dir, videoNames.first()))
     MetadataManager.write(
         outputFile = session.metadataFile,
         metadata = MetadataManager.SessionMetadata(
             sessionId = session.sessionId,
             startTimestampNs = session.startTimestampNs,
             endTimestampNs = endNs,
-            videoFile = session.videoFile.name,
+            videoFile = videoNames.first(),
             imuFile = session.imuFile.name,
             guardianSummary = guardianSummary,
             preFlightStatus = preFlight,
             events = events,
-            status = status
+            status = status,
+            config = config,
+            bootElapsedNsAtStart = session.startTimestampNs,
+            recordingProfile = config?.profile?.id ?: RecordingProfile.QUALITY.id,
+            achievedWidth = size.first,
+            achievedHeight = size.second,
+            videoFileNames = videoNames,
+            pauseIntervalsNs = pauseIntervals,
+            sensorGaps = sensorGaps,
+            thermalAtEnd = 0
         )
     )
+    if (mountOverride) {
+        try {
+            val json = JSONObject(session.metadataFile.readText())
+            json.put("mount_check_overridden", true)
+            session.metadataFile.writeText(json.toString(2))
+        } catch (_: Exception) {
+        }
+    }
+}
+
+private fun probeVideoSize(file: File): Pair<Int, Int> {
+    if (!file.exists()) return 0 to 0
+    return try {
+        val retriever = MediaMetadataRetriever()
+        retriever.setDataSource(file.absolutePath)
+        val w = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_VIDEO_WIDTH)?.toIntOrNull() ?: 0
+        val h = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_VIDEO_HEIGHT)?.toIntOrNull() ?: 0
+        retriever.release()
+        w to h
+    } catch (_: Exception) {
+        0 to 0
+    }
 }
 
 private fun formatMmSs(elapsedMs: Long): String {

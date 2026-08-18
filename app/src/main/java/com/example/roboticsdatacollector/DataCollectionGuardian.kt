@@ -50,9 +50,20 @@ class DataCollectionGuardian(
     private val blurStreak = AtomicInteger(0)
     private val darkStreak = AtomicInteger(0)
     private val brightStreak = AtomicInteger(0)
+    private val obstructStreak = AtomicInteger(0)
+    private val workspaceBadStreak = AtomicInteger(0)
+    private val noneStreak = AtomicInteger(0)
+    private val workspaceVisibleFrames = AtomicInteger(0)
+    private val obstructedFrames = AtomicInteger(0)
+    private val droppedFrames = AtomicInteger(0)
+    private val lastFrameTimestampNs = AtomicLong(0L)
     private val qualityAnalyzer = FrameQualityAnalyzer()
     private val landmarkerRef = AtomicReference<HandLandmarker?>(null)
     private val initAttempted = AtomicBoolean(false)
+    private val handsOutHapticFired = AtomicBoolean(false)
+
+    var onQualitySample: ((org.json.JSONObject) -> Unit)? = null
+    var onHandsOutEscalation: (() -> Unit)? = null
 
     @Volatile
     var detectorBackend: DetectorBackend = DetectorBackend.UNINITIALIZED
@@ -63,11 +74,23 @@ class DataCollectionGuardian(
     private val _isHandVisible = MutableStateFlow(false)
     val isHandVisible: StateFlow<Boolean> = _isHandVisible.asStateFlow()
 
+    private val _handState = MutableStateFlow(HandVisibilityState.NONE)
+    val handState: StateFlow<HandVisibilityState> = _handState.asStateFlow()
+
+    private val _workspaceVisible = MutableStateFlow(false)
+    val workspaceVisible: StateFlow<Boolean> = _workspaceVisible.asStateFlow()
+
+    private val _visibilityClass = MutableStateFlow(VisibilityClass.POOR)
+    val visibilityClass: StateFlow<VisibilityClass> = _visibilityClass.asStateFlow()
+
     private val _analyzedFrameCount = MutableStateFlow(0)
     val analyzedFrameCount: StateFlow<Int> = _analyzedFrameCount.asStateFlow()
 
     private val _qualityWarning = MutableStateFlow(QualityWarning.None)
     val qualityWarning: StateFlow<QualityWarning> = _qualityWarning.asStateFlow()
+
+    private val _guardianDegraded = MutableStateFlow(false)
+    val guardianDegraded: StateFlow<Boolean> = _guardianDegraded.asStateFlow()
 
     fun start() {
         ensureLandmarker()
@@ -79,10 +102,22 @@ class DataCollectionGuardian(
         blurStreak.set(0)
         darkStreak.set(0)
         brightStreak.set(0)
+        obstructStreak.set(0)
+        workspaceBadStreak.set(0)
+        noneStreak.set(0)
+        workspaceVisibleFrames.set(0)
+        obstructedFrames.set(0)
+        droppedFrames.set(0)
+        lastFrameTimestampNs.set(0L)
+        handsOutHapticFired.set(false)
         lastAnalyzedElapsedNs.set(0L)
         _analyzedFrameCount.value = 0
         _isHandVisible.value = false
+        _handState.value = HandVisibilityState.NONE
+        _workspaceVisible.value = false
+        _visibilityClass.value = VisibilityClass.POOR
         _qualityWarning.value = QualityWarning.None
+        _guardianDegraded.value = detectorBackend == DetectorBackend.DISABLED
         running.set(true)
         Log.i(TAG, "Guardian started backend=$detectorBackend fps=$targetAnalysisFps")
     }
@@ -114,7 +149,11 @@ class DataCollectionGuardian(
             underexposedFramesPercentage = pct(underexposedFrames.get()),
             overexposedFramesPercentage = pct(overexposedFrames.get()),
             detector = detectorBackend.metadataName,
-            modelAsset = MODEL_ASSET
+            modelAsset = MODEL_ASSET,
+            workspaceVisiblePercentage = pct(workspaceVisibleFrames.get()),
+            obstructedFramesPercentage = pct(obstructedFrames.get()),
+            droppedFrames = droppedFrames.get(),
+            guardianDegraded = _guardianDegraded.value
         )
     }
 
@@ -129,20 +168,55 @@ class DataCollectionGuardian(
 
             ensureLandmarker()
 
+            val frameTs = image.imageInfo.timestamp
+            val previousTs = lastFrameTimestampNs.getAndSet(frameTs)
+            if (previousTs > 0L && frameTs > previousTs) {
+                val gapNs = frameTs - previousTs
+                if (gapNs > EXPECTED_ANALYSIS_GAP_NS * 2) {
+                    droppedFrames.addAndGet(((gapNs / EXPECTED_ANALYSIS_GAP_NS) - 1).toInt().coerceAtLeast(1))
+                }
+            }
+
             val quality = qualityAnalyzer.analyze(image)
-            val visible = detectHands(image)
+            val hands = detectHands(image)
+            val visible = hands != HandVisibilityState.NONE
             val total = totalAnalyzedFrames.incrementAndGet()
             if (visible) handDetectedFrames.incrementAndGet()
             if (quality.isBlurred) blurredFrames.incrementAndGet()
             if (quality.isUnderexposed) underexposedFrames.incrementAndGet()
             if (quality.isOverexposed) overexposedFrames.incrementAndGet()
+            if (quality.workspaceVisible) workspaceVisibleFrames.incrementAndGet()
+            if (quality.isObstructed) obstructedFrames.incrementAndGet()
 
-            updateQualityWarning(quality)
+            val ivs = computeVisibilityClass(hands, quality)
+            updateQualityWarning(quality, hands)
 
             _isHandVisible.value = visible
+            _handState.value = hands
+            _workspaceVisible.value = quality.workspaceVisible
+            _visibilityClass.value = ivs
             _analyzedFrameCount.value = total
+            _guardianDegraded.value = detectorBackend == DetectorBackend.DISABLED
+
+            onQualitySample?.invoke(
+                org.json.JSONObject().apply {
+                    put("timestamp_ns", nowNs)
+                    put("hands", hands.name)
+                    put("workspace_visible", quality.workspaceVisible)
+                    put("obstructed", quality.isObstructed)
+                    put("laplacian_variance", quality.laplacianVariance)
+                    put("mean_luminance", quality.meanLuminance)
+                    put("blurred", quality.isBlurred)
+                    put("underexposed", quality.isUnderexposed)
+                    put("overexposed", quality.isOverexposed)
+                    put("ivs", ivs.name)
+                    put("dropped_frames_total", droppedFrames.get())
+                    put("guardian_degraded", _guardianDegraded.value)
+                }
+            )
         } catch (e: Exception) {
-            Log.e(TAG, "Frame analysis failed", e)
+            Log.e(TAG, "Frame analysis failed; capture continues", e)
+            _guardianDegraded.value = true
         } finally {
             image.close()
         }
@@ -152,7 +226,26 @@ class DataCollectionGuardian(
      * Shows a HUD warning only after the defect is sustained for ~1 second
      * (~[targetAnalysisFps] consecutive analyzed frames).
      */
-    private fun updateQualityWarning(quality: FrameQuality) {
+    private fun computeVisibilityClass(
+        hands: HandVisibilityState,
+        quality: FrameQuality
+    ): VisibilityClass {
+        val handsOk = hands == HandVisibilityState.BOTH || hands == HandVisibilityState.LEFT ||
+            hands == HandVisibilityState.RIGHT
+        return when {
+            quality.isObstructed || hands == HandVisibilityState.NONE || !quality.workspaceVisible ->
+                VisibilityClass.POOR
+            hands == HandVisibilityState.BOTH &&
+                quality.workspaceVisible &&
+                !quality.isBlurred &&
+                !quality.isUnderexposed &&
+                !quality.isOverexposed -> VisibilityClass.GOOD
+            handsOk && quality.workspaceVisible -> VisibilityClass.DEGRADED
+            else -> VisibilityClass.POOR
+        }
+    }
+
+    private fun updateQualityWarning(quality: FrameQuality, hands: HandVisibilityState) {
         val needed = targetAnalysisFps.coerceIn(3, 5)
         val blur = if (quality.isBlurred) blurStreak.incrementAndGet() else {
             blurStreak.set(0); 0
@@ -163,16 +256,34 @@ class DataCollectionGuardian(
         val bright = if (quality.isOverexposed) brightStreak.incrementAndGet() else {
             brightStreak.set(0); 0
         }
+        val obstruct = if (quality.isObstructed) obstructStreak.incrementAndGet() else {
+            obstructStreak.set(0); 0
+        }
+        val workspaceBad = if (!quality.workspaceVisible) workspaceBadStreak.incrementAndGet() else {
+            workspaceBadStreak.set(0); 0
+        }
+        val none = if (hands == HandVisibilityState.NONE) noneStreak.incrementAndGet() else {
+            noneStreak.set(0)
+            handsOutHapticFired.set(false)
+            0
+        }
+        val noneSeconds = none / targetAnalysisFps.coerceIn(3, 5).toFloat()
+        if (noneSeconds >= 8f && handsOutHapticFired.compareAndSet(false, true)) {
+            onHandsOutEscalation?.invoke()
+        }
         _qualityWarning.value = when {
+            obstruct >= needed -> QualityWarning.Obstructed
             dark >= needed -> QualityWarning.TooDark
             bright >= needed -> QualityWarning.TooBright
             blur >= needed -> QualityWarning.TooMuchMotion
+            noneSeconds >= 8f -> QualityWarning.HandsOut
+            workspaceBad >= needed * 2 -> QualityWarning.Workspace
             else -> QualityWarning.None
         }
     }
 
-    private fun detectHands(image: ImageProxy): Boolean {
-        val landmarker = landmarkerRef.get() ?: return false
+    private fun detectHands(image: ImageProxy): HandVisibilityState {
+        val landmarker = landmarkerRef.get() ?: return HandVisibilityState.NONE
 
         var mpImage: MPImage? = null
         var argb: Bitmap? = null
@@ -185,10 +296,11 @@ class DataCollectionGuardian(
             }
             mpImage = BitmapImageBuilder(argb).build()
             val result = landmarker.detect(mpImage)
-            hasAcceptedHand(result)
+            parseHandState(result)
         } catch (e: Exception) {
             Log.e(TAG, "MediaPipe detect failed; treating frame as no-hands", e)
-            false
+            _guardianDegraded.value = true
+            HandVisibilityState.NONE
         } finally {
             mpImage?.close()
             argb?.takeIf { !it.isRecycled }?.recycle()
@@ -199,22 +311,51 @@ class DataCollectionGuardian(
      * Rejects low-confidence and geometrically implausible landmark sets.
      * Emulator GPU often emits a full 21-point skeleton with no real hand.
      */
-    private fun hasAcceptedHand(result: HandLandmarkerResult): Boolean {
+    private fun parseHandState(result: HandLandmarkerResult): HandVisibilityState {
         val hands = result.landmarks()
-        if (hands.isEmpty()) return false
+        if (hands.isEmpty()) return HandVisibilityState.NONE
         val handedness = result.handedness()
+        var left = false
+        var right = false
+        var partial = false
 
         for (index in hands.indices) {
             val landmarks = hands[index]
             val score = handednessScore(handedness, index)
-            if (isPlausibleHand(landmarks, score)) {
-                if (Log.isLoggable(TAG, Log.DEBUG)) {
-                    Log.d(TAG, "Accepted hand index=$index score=$score")
-                }
-                return true
+            if (!isPlausibleHand(landmarks, score)) continue
+            if (isPartialHand(landmarks)) partial = true
+            val label = handednessLabel(handedness, index)
+            when {
+                label.contains("left", ignoreCase = true) -> left = true
+                label.contains("right", ignoreCase = true) -> right = true
+                else -> right = true
             }
         }
-        return false
+        return when {
+            left && right -> HandVisibilityState.BOTH
+            partial && (left || right) -> HandVisibilityState.PARTIAL
+            left -> HandVisibilityState.LEFT
+            right -> HandVisibilityState.RIGHT
+            else -> HandVisibilityState.NONE
+        }
+    }
+
+    private fun handednessLabel(
+        handedness: List<List<Category>>,
+        handIndex: Int
+    ): String {
+        val categories = handedness.getOrNull(handIndex) ?: return ""
+        return categories.maxByOrNull { it.score() }?.categoryName().orEmpty()
+    }
+
+    private fun isPartialHand(landmarks: List<NormalizedLandmark>): Boolean {
+        var edgeHits = 0
+        for (landmark in landmarks) {
+            val x = landmark.x()
+            val y = landmark.y()
+            if (x < 0.03f || x > 0.97f || y < 0.03f || y > 0.97f) edgeHits++
+        }
+        return edgeHits >= 5
     }
 
     private fun handednessScore(
@@ -403,5 +544,6 @@ class DataCollectionGuardian(
         private const val MIN_LANDMARK_SPREAD = 0.03
         private const val MIN_PALM_LENGTH = 0.08
         private const val MIN_LANDMARKS_IN_FRAME = 16
+        private const val EXPECTED_ANALYSIS_GAP_NS = 250_000_000L
     }
 }

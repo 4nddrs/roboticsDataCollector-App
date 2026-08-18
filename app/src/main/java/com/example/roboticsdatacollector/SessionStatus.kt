@@ -5,8 +5,10 @@ package com.example.roboticsdatacollector
  */
 object SessionStatus {
     const val RECORDING = "RECORDING"
+    const val PAUSED = "PAUSED"
     const val COMPLETED = "COMPLETED"
     const val INTERRUPTED_LOW_BATTERY = "INTERRUPTED_LOW_BATTERY"
+    const val INTERRUPTED_LOW_STORAGE = "INTERRUPTED_LOW_STORAGE"
     const val INTERRUPTED_SYSTEM = "INTERRUPTED_SYSTEM"
     const val ERROR = "ERROR"
 }

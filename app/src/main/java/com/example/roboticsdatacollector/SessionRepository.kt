@@ -21,7 +21,10 @@ data class SessionRecord(
     val createdAtEpochMs: Long,
     val videoFile: File?,
     val imuFile: File?,
-    val metadataFile: File?
+    val metadataFile: File?,
+    val experiment: String = "",
+    val participantId: String = "",
+    val task: String = ""
 ) {
     val totalMb: Double get() = totalBytes / (1024.0 * 1024.0)
     val createdLabel: String
@@ -42,13 +45,33 @@ class SessionRepository(private val context: Context) {
     fun listSessions(): List<SessionRecord> {
         return sessionRoots()
             .flatMap { root ->
-                root.listFiles { file -> file.isDirectory && file.name.startsWith(SESSION_PREFIX) }
-                    ?.toList()
-                    .orEmpty()
+                root.walkTopDown()
+                    .maxDepth(4)
+                    .filter { it.isDirectory && it.name.startsWith(SESSION_PREFIX) }
+                    .toList()
             }
             .distinctBy { it.absolutePath }
             .mapNotNull { parseSession(it) }
             .sortedByDescending { it.createdAtEpochMs }
+    }
+
+    fun orphanSessions(): List<SessionRecord> {
+        return listSessions().filter {
+            it.status == SessionStatus.RECORDING || it.status == SessionStatus.PAUSED
+        }
+    }
+
+    fun recoverSession(session: SessionRecord): Boolean {
+        val metadata = session.metadataFile ?: return false
+        return try {
+            val json = JSONObject(metadata.readText())
+            json.put("status", SessionStatus.INTERRUPTED_SYSTEM)
+            metadata.writeText(json.toString(2))
+            true
+        } catch (e: Exception) {
+            Log.e(TAG, "Recover failed", e)
+            false
+        }
     }
 
     fun deleteSession(session: SessionRecord): Boolean {
@@ -61,8 +84,9 @@ class SessionRepository(private val context: Context) {
     }
 
     fun shareIntent(session: SessionRecord): Intent? {
-        val files = listOfNotNull(session.videoFile, session.imuFile, session.metadataFile)
-            .filter { it.exists() && it.isFile }
+        val files = session.directory.walkTopDown()
+            .filter { it.isFile && !it.name.endsWith(".tmp") }
+            .toList()
         if (files.isEmpty()) return null
         val uris = ArrayList<Uri>(files.size)
         files.forEach { file ->
@@ -105,7 +129,10 @@ class SessionRepository(private val context: Context) {
             val createdAt = createdFromId
                 ?: json?.optLong("checked_at_epoch_ms", 0L)?.takeIf { it > 0 }
                 ?: dir.lastModified()
-            val video = File(dir, "video.mp4").takeIf { it.exists() }
+            val config = json?.optJSONObject("session_config")
+            val video = dir.listFiles { file ->
+                file.isFile && (file.name == "video.mp4" || file.name.matches(Regex("video_\\d+\\.mp4")))
+            }?.maxByOrNull { it.length() }
             val imu = File(dir, "imu_data.csv").takeIf { it.exists() }
             SessionRecord(
                 sessionId = sessionId,
@@ -117,7 +144,10 @@ class SessionRepository(private val context: Context) {
                 createdAtEpochMs = createdAt,
                 videoFile = video,
                 imuFile = imu,
-                metadataFile = metadataFile
+                metadataFile = metadataFile,
+                experiment = config?.optString("experiment").orEmpty(),
+                participantId = config?.optString("participant_id").orEmpty(),
+                task = config?.optString("task").orEmpty()
             )
         } catch (e: Exception) {
             Log.w(TAG, "Skipping unreadable session ${dir.name}", e)

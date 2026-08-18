@@ -19,6 +19,24 @@ class HapticFeedbackManager(context: Context) {
 
     fun playMark() = playOneShot(durationMs = 50L, amplitude = 180)
 
+    fun playStart() = playOneShot(durationMs = 40L, amplitude = 160)
+
+    fun playStop() {
+        val device = vibrator ?: return
+        if (!device.hasVibrator()) return
+        try {
+            val timings = longArrayOf(0L, 40L, 80L, 40L)
+            val amplitudes = intArrayOf(0, 180, 0, 180)
+            device.vibrate(VibrationEffect.createWaveform(timings, amplitudes, -1))
+        } catch (e: Exception) {
+            Log.w(TAG, "Stop haptic failed", e)
+        }
+    }
+
+    fun playCritical() = playOneShot(durationMs = 280L, amplitude = 255)
+
+    fun playHandsAlertOnce() = playOneShot(durationMs = 70L, amplitude = 140)
+
     fun playSuccess() = playOneShot(durationMs = 50L, amplitude = 180)
 
     fun playFailure() {

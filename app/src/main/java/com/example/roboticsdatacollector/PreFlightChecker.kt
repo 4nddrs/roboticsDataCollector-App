@@ -23,6 +23,7 @@ class PreFlightChecker(private val context: Context) {
         val battery = checkBattery()
         val sensors = checkSensors()
         val permissions = checkPermissions()
+        val thermal = checkThermal()
         return PreFlightReport(
             storageFreeBytes = storage.freeBytes,
             storagePassed = storage.passed,
@@ -39,6 +40,11 @@ class PreFlightChecker(private val context: Context) {
             audioGranted = permissions.audio,
             permissionsPassed = permissions.passed,
             permissionsDetail = permissions.detail,
+            thermalStatus = thermal.status,
+            thermalPassed = thermal.passed,
+            thermalDetail = thermal.detail,
+            timestampOk = true,
+            timestampDetail = "elapsedRealtimeNanos monotonic clock",
             checkedAtEpochMs = System.currentTimeMillis()
         )
     }
@@ -106,6 +112,19 @@ class PreFlightChecker(private val context: Context) {
         return PermissionResult(camera, audio, passed, detail)
     }
 
+    private fun checkThermal(): ThermalResult {
+        val status = DeviceHealth.thermalStatus(context)
+        val passed = DeviceHealth.thermalOk(context)
+        val label = when {
+            android.os.Build.VERSION.SDK_INT < android.os.Build.VERSION_CODES.Q -> "Thermal N/A (API < 29)"
+            status >= android.os.PowerManager.THERMAL_STATUS_CRITICAL -> "CRITICAL — wait to cool"
+            status >= android.os.PowerManager.THERMAL_STATUS_SEVERE -> "SEVERE — too hot to start"
+            status >= android.os.PowerManager.THERMAL_STATUS_MODERATE -> "Moderate — OK"
+            else -> "Nominal"
+        }
+        return ThermalResult(status, passed, label)
+    }
+
     private fun availableBytes(path: File): Long {
         return try {
             if (!path.exists()) path.mkdirs()
@@ -151,6 +170,7 @@ class PreFlightChecker(private val context: Context) {
         val passed: Boolean,
         val detail: String
     )
+    private data class ThermalResult(val status: Int, val passed: Boolean, val detail: String)
 
     companion object {
         const val MIN_FREE_BYTES: Long = 2L * 1024L * 1024L * 1024L
@@ -179,10 +199,15 @@ data class PreFlightReport(
     val audioGranted: Boolean,
     val permissionsPassed: Boolean,
     val permissionsDetail: String,
+    val thermalStatus: Int = 0,
+    val thermalPassed: Boolean = true,
+    val thermalDetail: String = "Nominal",
+    val timestampOk: Boolean = true,
+    val timestampDetail: String = "elapsedRealtimeNanos",
     val checkedAtEpochMs: Long
 ) {
     val allPassed: Boolean
-        get() = storagePassed && batteryPassed && sensorsPassed && permissionsPassed
+        get() = storagePassed && batteryPassed && sensorsPassed && permissionsPassed && thermalPassed && timestampOk
 
     val canStartSession: Boolean
         get() = allPassed
@@ -201,6 +226,9 @@ data class PreFlightReport(
         put("camera_permission", cameraGranted)
         put("audio_permission", audioGranted)
         put("permissions_ok", permissionsPassed)
+        put("thermal_status", thermalStatus)
+        put("thermal_ok", thermalPassed)
+        put("timestamp_ok", timestampOk)
         put("checked_at_epoch_ms", checkedAtEpochMs)
     }
 }

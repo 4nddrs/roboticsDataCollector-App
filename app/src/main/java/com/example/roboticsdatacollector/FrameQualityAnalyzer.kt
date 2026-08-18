@@ -40,6 +40,9 @@ class FrameQualityAnalyzer(
         var sumY = 0L
         var sumLap = 0.0
         var sumLapSq = 0.0
+        var lowerCount = 0L
+        var lowerSum = 0L
+        var lowerSq = 0L
 
         var y = 1
         while (y < height - 1) {
@@ -51,6 +54,11 @@ class FrameQualityAnalyzer(
                 sumLap += lap
                 sumLapSq += lap * lap
                 count++
+                if (y > height / 2) {
+                    lowerCount++
+                    lowerSum += center
+                    lowerSq += center * center.toLong()
+                }
                 x += step
             }
             y += step
@@ -60,14 +68,23 @@ class FrameQualityAnalyzer(
 
         val meanY = sumY.toDouble() / count
         val meanLap = sumLap / count
-        val laplacianVariance = (sumLapSq / count) - meanLap * meanLap
+        val laplacianVariance = ((sumLapSq / count) - meanLap * meanLap).coerceAtLeast(0.0)
+        val lowerMean = if (lowerCount == 0L) meanY else lowerSum.toDouble() / lowerCount
+        val lowerVar = if (lowerCount == 0L) 0.0 else {
+            (lowerSq.toDouble() / lowerCount) - lowerMean * lowerMean
+        }
+        val lowerStd = kotlin.math.sqrt(lowerVar.coerceAtLeast(0.0))
+        val workspaceVisible = lowerMean in 35.0..210.0 && lowerStd >= 12.0
+        val obstructed = meanY < 22.0 && laplacianVariance < 28.0 && lowerStd < 8.0
 
         return FrameQuality(
-            laplacianVariance = laplacianVariance.coerceAtLeast(0.0),
+            laplacianVariance = laplacianVariance,
             meanLuminance = meanY,
             isBlurred = laplacianVariance < blurThreshold,
             isUnderexposed = meanY < underexposedThreshold,
-            isOverexposed = meanY > overexposedThreshold
+            isOverexposed = meanY > overexposedThreshold,
+            workspaceVisible = workspaceVisible,
+            isObstructed = obstructed
         )
     }
 
@@ -83,7 +100,9 @@ data class FrameQuality(
     val meanLuminance: Double,
     val isBlurred: Boolean,
     val isUnderexposed: Boolean,
-    val isOverexposed: Boolean
+    val isOverexposed: Boolean,
+    val workspaceVisible: Boolean = true,
+    val isObstructed: Boolean = false
 ) {
     companion object {
         fun invalid() = FrameQuality(
@@ -91,7 +110,9 @@ data class FrameQuality(
             meanLuminance = 0.0,
             isBlurred = false,
             isUnderexposed = false,
-            isOverexposed = false
+            isOverexposed = false,
+            workspaceVisible = false,
+            isObstructed = false
         )
     }
 }
@@ -100,7 +121,10 @@ enum class QualityWarningKind {
     NONE,
     BLUR,
     UNDEREXPOSED,
-    OVEREXPOSED
+    OVEREXPOSED,
+    HANDS,
+    WORKSPACE,
+    OBSTRUCTION
 }
 
 data class QualityWarning(
@@ -109,8 +133,11 @@ data class QualityWarning(
 ) {
     companion object {
         val None = QualityWarning(QualityWarningKind.NONE, null)
-        val TooMuchMotion = QualityWarning(QualityWarningKind.BLUR, "⚠️ Too much motion")
-        val TooDark = QualityWarning(QualityWarningKind.UNDEREXPOSED, "⚠️ Low light")
-        val TooBright = QualityWarning(QualityWarningKind.OVEREXPOSED, "⚠️ Too much light")
+        val TooMuchMotion = QualityWarning(QualityWarningKind.BLUR, "Too much motion")
+        val TooDark = QualityWarning(QualityWarningKind.UNDEREXPOSED, "Low light")
+        val TooBright = QualityWarning(QualityWarningKind.OVEREXPOSED, "Too much light")
+        val HandsOut = QualityWarning(QualityWarningKind.HANDS, "Move camera down slightly — hands not visible")
+        val Workspace = QualityWarning(QualityWarningKind.WORKSPACE, "Workspace not visible — tilt camera down")
+        val Obstructed = QualityWarning(QualityWarningKind.OBSTRUCTION, "Camera partially obstructed")
     }
 }

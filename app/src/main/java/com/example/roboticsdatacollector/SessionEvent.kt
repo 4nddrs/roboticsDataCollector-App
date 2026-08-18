@@ -53,10 +53,25 @@ class SessionEventLogger(
     val isRecording: Boolean
         get() = recording.get()
 
+    val isCapturing: Boolean
+        get() = recording.get() && !paused.get()
+
+    private val paused = AtomicBoolean(false)
+
     fun beginSession() {
         events.clear()
         _flash.value = null
+        paused.set(false)
         recording.set(true)
+    }
+
+    fun notifyStart() = haptics.playStart()
+    fun notifyStop() = haptics.playStop()
+    fun notifyCritical() = haptics.playCritical()
+    fun notifyHandsOut() = haptics.playHandsAlertOnce()
+
+    fun setPaused(value: Boolean) {
+        paused.set(value)
     }
 
     fun endSession(): List<SessionEvent> {
@@ -67,7 +82,7 @@ class SessionEventLogger(
     fun snapshot(): List<SessionEvent> = events.toList()
 
     fun record(eventType: String): SessionEvent? {
-        if (!recording.get()) return null
+        if (!recording.get() || paused.get()) return null
         val event = SessionEvent.now(eventType)
         events.add(event)
         when (eventType) {

@@ -14,6 +14,7 @@ import java.util.concurrent.atomic.AtomicBoolean
 
 enum class SessionProtectReason {
     LOW_BATTERY,
+    LOW_STORAGE,
     SYSTEM
 }
 

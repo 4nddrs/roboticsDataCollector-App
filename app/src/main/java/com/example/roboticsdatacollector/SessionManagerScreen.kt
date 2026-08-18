@@ -292,6 +292,15 @@ private fun SessionCard(
                                 color = TextMuted,
                                 fontSize = 12.sp
                             )
+                            if (session.participantId.isNotBlank()) {
+                                Text(
+                                    text = "${session.experiment} · ${session.participantId} · ${session.task}",
+                                    color = TextMuted,
+                                    fontSize = 11.sp,
+                                    maxLines = 1,
+                                    overflow = TextOverflow.Ellipsis
+                                )
+                            }
                         }
                     }
                     StatusBadge(session.status)
