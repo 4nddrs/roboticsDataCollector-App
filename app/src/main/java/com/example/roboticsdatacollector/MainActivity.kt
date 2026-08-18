@@ -17,13 +17,11 @@ import androidx.activity.enableEdgeToEdge
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.camera.core.CameraSelector
 import androidx.camera.core.ImageAnalysis
-import androidx.camera.video.FileOutputOptions
 import androidx.camera.video.Recording
 import androidx.camera.video.VideoRecordEvent
 import androidx.camera.view.CameraController
 import androidx.camera.view.LifecycleCameraController
 import androidx.camera.view.PreviewView
-import androidx.camera.view.video.AudioConfig
 import androidx.compose.animation.core.RepeatMode
 import androidx.compose.animation.core.animateFloat
 import androidx.compose.animation.core.infiniteRepeatable
@@ -86,18 +84,23 @@ import androidx.lifecycle.LifecycleEventObserver
 import androidx.lifecycle.compose.LocalLifecycleOwner
 import com.example.roboticsdatacollector.ui.theme.RoboticsDataCollectorTheme
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.collect
 import java.io.File
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
+import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicReference
 import java.util.concurrent.TimeUnit
 
 class MainActivity : ComponentActivity() {
 
-    private lateinit var sensorLogger: SensorLogger
+    private lateinit var sensorDataManager: SensorDataManager
     private lateinit var guardian: DataCollectionGuardian
     private lateinit var eventLogger: SessionEventLogger
+    private lateinit var videoRecorder: VideoRecorder
+    private lateinit var sessionSafety: SessionSafetyManager
     private var analysisExecutor: ExecutorService? = null
+    private val emergencyStop = AtomicReference<((String) -> Unit)?>(null)
 
     private val keyHandler = Handler(Looper.getMainLooper())
     private var volumeDownDownAtMs = 0L
@@ -115,18 +118,23 @@ class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         enableEdgeToEdge()
-        sensorLogger = SensorLogger(this)
+        sensorDataManager = SensorDataManager(this)
         guardian = DataCollectionGuardian(this, targetAnalysisFps = 4)
         eventLogger = SessionEventLogger(HapticFeedbackManager(this))
+        videoRecorder = VideoRecorder()
+        sessionSafety = SessionSafetyManager(this) { eventLogger.isRecording }
         analysisExecutor = Executors.newSingleThreadExecutor()
 
         setContent {
             RoboticsDataCollectorTheme {
                 DataCollectionScreen(
-                    sensorLogger = sensorLogger,
+                    sensorDataManager = sensorDataManager,
                     guardian = guardian,
                     eventLogger = eventLogger,
+                    videoRecorder = videoRecorder,
+                    sessionSafety = sessionSafety,
                     analysisExecutor = analysisExecutor!!,
+                    emergencyStop = emergencyStop,
                     onKeepScreenOn = { enabled ->
                         if (enabled) {
                             window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
@@ -196,16 +204,40 @@ class MainActivity : ComponentActivity() {
         }
     }
 
+    override fun onStop() {
+        super.onStop()
+        if (isFinishing) {
+            flushActiveSession(SessionStatus.INTERRUPTED_SYSTEM)
+        }
+    }
+
     override fun onDestroy() {
         keyHandler.removeCallbacks(commitVolumeDownSuccess)
+        flushActiveSession(SessionStatus.INTERRUPTED_SYSTEM)
         try {
+            sessionSafety.stopMonitoring()
             guardian.close()
-            sensorLogger.release()
+            sensorDataManager.release()
             analysisExecutor?.shutdown()
         } catch (e: Exception) {
             Log.w(TAG, "onDestroy cleanup", e)
         }
         super.onDestroy()
+    }
+
+    private fun flushActiveSession(status: String) {
+        if (!eventLogger.isRecording) {
+            videoRecorder.forceFinalize()
+            sensorDataManager.forceFlushAndClose()
+            return
+        }
+        val handler = emergencyStop.get()
+        if (handler != null) {
+            handler(status)
+        } else {
+            videoRecorder.forceFinalize()
+            sensorDataManager.forceFlushAndClose()
+        }
     }
 
     companion object {
@@ -222,10 +254,13 @@ private val REQUIRED_PERMISSIONS = arrayOf(
 
 @Composable
 fun DataCollectionScreen(
-    sensorLogger: SensorLogger,
+    sensorDataManager: SensorDataManager,
     guardian: DataCollectionGuardian,
     eventLogger: SessionEventLogger,
+    videoRecorder: VideoRecorder,
+    sessionSafety: SessionSafetyManager,
     analysisExecutor: ExecutorService,
+    emergencyStop: AtomicReference<((String) -> Unit)?>,
     onKeepScreenOn: (Boolean) -> Unit
 ) {
     val context = LocalContext.current
@@ -280,10 +315,13 @@ fun DataCollectionScreen(
 
     var isRecording by remember { mutableStateOf(false) }
     var recError by remember { mutableStateOf<String?>(null) }
+    var safetyBanner by remember { mutableStateOf<String?>(null) }
     var activeRecording by remember { mutableStateOf<Recording?>(null) }
     var currentSession by remember { mutableStateOf<SessionFiles?>(null) }
     val recordingRef = remember { AtomicReference<Recording?>(null) }
     val sessionRef = remember { AtomicReference<SessionFiles?>(null) }
+    val sessionClosing = remember { AtomicBoolean(false) }
+    val stopSessionRef = remember { AtomicReference<((String) -> Unit)?>(null) }
 
     val isHandVisible by guardian.isHandVisible.collectAsState()
     val analyzedFrameCount by guardian.analyzedFrameCount.collectAsState()
@@ -294,6 +332,13 @@ fun DataCollectionScreen(
         if (eventFlash == null) return@LaunchedEffect
         delay(1_400)
         eventLogger.clearFlash()
+    }
+
+    LaunchedEffect(safetyBanner, isRecording) {
+        if (safetyBanner != null && !isRecording) {
+            delay(1_200)
+            safetyBanner = null
+        }
     }
 
     var elapsedMs by remember { mutableLongStateOf(0L) }
@@ -337,44 +382,65 @@ fun DataCollectionScreen(
     }
 
     DisposableEffect(Unit) {
+        emergencyStop.set { status ->
+            stopSessionRef.get()?.invoke(status)
+        }
         onDispose {
+            emergencyStop.set(null)
             try {
-                recordingRef.get()?.stop()
+                videoRecorder.forceFinalize()
             } catch (_: Exception) {
             }
+            sessionSafety.stopMonitoring()
             sessionRef.get()?.let { session ->
                 writeSessionMetadata(
                     session,
                     guardian,
-                    status = "aborted",
+                    status = SessionStatus.INTERRUPTED_SYSTEM,
                     preFlight = preFlightAtSessionStart,
                     events = eventLogger.endSession()
                 )
             }
             guardian.stop()
-            sensorLogger.stopLogging()
+            sensorDataManager.forceFlushAndClose()
             onKeepScreenOn(false)
         }
     }
 
-    fun stopSession() {
+    LaunchedEffect(sessionSafety) {
+        sessionSafety.protectEvents.collect { reason ->
+            val (status, message) = when (reason) {
+                SessionProtectReason.LOW_BATTERY ->
+                    SessionStatus.INTERRUPTED_LOW_BATTERY to "Critical battery: Saving session..."
+                SessionProtectReason.SYSTEM ->
+                    SessionStatus.INTERRUPTED_SYSTEM to "System interrupt: Saving session..."
+            }
+            safetyBanner = message
+            Toast.makeText(context, message, Toast.LENGTH_LONG).show()
+            stopSessionRef.get()?.invoke(status)
+        }
+    }
+
+    fun stopSession(status: String = SessionStatus.COMPLETED) {
+        if (!sessionClosing.compareAndSet(false, true)) return
         val session = currentSession
         val summary = guardian.snapshotSummary()
+        sessionSafety.stopMonitoring()
         try {
-            (recordingRef.get() ?: activeRecording)?.stop()
+            videoRecorder.forceFinalize()
         } catch (e: Exception) {
             Log.e("DataCollection", "Failed to stop video", e)
         }
         activeRecording = null
         recordingRef.set(null)
         guardian.stop()
-        sensorLogger.stopLogging()
+        sensorDataManager.forceFlushAndClose()
         val events = eventLogger.endSession()
         session?.let {
             writeSessionMetadata(
                 it,
                 guardianSummary = summary,
-                status = "completed",
+                status = status,
                 preFlight = preFlightAtSessionStart,
                 events = events
             )
@@ -383,11 +449,22 @@ fun DataCollectionScreen(
         currentSession = null
         isRecording = false
         onKeepScreenOn(false)
-        Toast.makeText(context, "Session saved", Toast.LENGTH_SHORT).show()
+        val savedMessage = when (status) {
+            SessionStatus.INTERRUPTED_LOW_BATTERY -> "Critical battery: Session saved"
+            SessionStatus.INTERRUPTED_SYSTEM -> "Interrupted: Session saved"
+            SessionStatus.ERROR -> "Session ended with errors"
+            else -> "Session saved"
+        }
+        Toast.makeText(context, savedMessage, Toast.LENGTH_SHORT).show()
+        safetyBanner = null
+        sessionClosing.set(false)
     }
+    stopSessionRef.set { status -> stopSession(status) }
 
     fun startSession() {
         recError = null
+        safetyBanner = null
+        sessionClosing.set(false)
         refreshPreFlight()
         val snapshot = preFlightChecker.evaluate()
         preFlight = snapshot
@@ -407,17 +484,26 @@ fun DataCollectionScreen(
             preFlightAtSessionStart = snapshot
             eventLogger.beginSession()
 
-            sensorLogger.startLogging(session.imuFile)
+            writeSessionMetadata(
+                session,
+                guardianSummary = MetadataManager.GuardianSummary(
+                    handsDetectedPercentage = 0.0,
+                    totalAnalyzedFrames = 0
+                ),
+                status = SessionStatus.RECORDING,
+                preFlight = snapshot,
+                events = emptyList()
+            )
+
+            sensorDataManager.startLogging(session.imuFile)
             guardian.start()
+            sessionSafety.startMonitoring()
 
-            val outputOptions = FileOutputOptions.Builder(session.videoFile).build()
-            val audioConfig = AudioConfig.create(true)
             val mainExecutor = ContextCompat.getMainExecutor(context)
-
-            activeRecording = cameraController.startRecording(
-                outputOptions,
-                audioConfig,
-                mainExecutor
+            activeRecording = videoRecorder.start(
+                controller = cameraController,
+                outputFile = session.videoFile,
+                executor = mainExecutor
             ) { event ->
                 when (event) {
                     is VideoRecordEvent.Start -> {
@@ -429,22 +515,9 @@ fun DataCollectionScreen(
                             recError = event.cause?.message ?: "Recording error"
                             Log.e("DataCollection", "Finalize error: ${event.error}", event.cause)
                             try {
-                                val failedSummary = guardian.snapshotSummary()
-                                guardian.stop()
-                                sensorLogger.stopLogging()
-                                currentSession?.let {
-                                    writeSessionMetadata(
-                                        it,
-                                        failedSummary,
-                                        status = "error",
-                                        preFlight = preFlightAtSessionStart,
-                                        events = eventLogger.endSession()
-                                    )
-                                }
+                                stopSession(SessionStatus.ERROR)
                             } catch (_: Exception) {
                             }
-                            isRecording = false
-                            onKeepScreenOn(false)
                         }
                     }
                 }
@@ -456,8 +529,10 @@ fun DataCollectionScreen(
         } catch (e: Exception) {
             Log.e("DataCollection", "Failed to start session", e)
             recError = e.message
+            sessionSafety.stopMonitoring()
             guardian.stop()
-            sensorLogger.stopLogging()
+            sensorDataManager.forceFlushAndClose()
+            videoRecorder.forceFinalize()
             eventLogger.endSession()
             isRecording = false
             onKeepScreenOn(false)
@@ -491,6 +566,7 @@ fun DataCollectionScreen(
             recError = recError,
             eventFlash = eventFlash,
             qualityWarning = qualityWarning,
+            safetyBanner = safetyBanner,
             modifier = Modifier
                 .fillMaxWidth()
                 .statusBarsPadding()
@@ -560,6 +636,7 @@ private fun CollectionHud(
     recError: String?,
     eventFlash: EventFlash?,
     qualityWarning: QualityWarning,
+    safetyBanner: String?,
     modifier: Modifier = Modifier
 ) {
     Column(
@@ -576,6 +653,19 @@ private fun CollectionHud(
                 isHandVisible = isHandVisible,
                 analyzedFrameCount = analyzedFrameCount,
                 sessionActive = isRecording
+            )
+        }
+        safetyBanner?.let { msg ->
+            Text(
+                text = msg,
+                color = Color.White,
+                fontWeight = FontWeight.Bold,
+                fontSize = 14.sp,
+                modifier = Modifier
+                    .align(Alignment.CenterHorizontally)
+                    .clip(RoundedCornerShape(10.dp))
+                    .background(Color(0xCCB71C1C))
+                    .padding(horizontal = 16.dp, vertical = 8.dp)
             )
         }
         if (isRecording && qualityWarning.kind != QualityWarningKind.NONE && qualityWarning.message != null) {

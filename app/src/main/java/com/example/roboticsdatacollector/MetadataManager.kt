@@ -39,7 +39,7 @@ object MetadataManager {
         val guardianSummary: GuardianSummary,
         val preFlightStatus: PreFlightReport? = null,
         val events: List<SessionEvent> = emptyList(),
-        val status: String = "completed"
+        val status: String = SessionStatus.COMPLETED
     ) {
         val durationSeconds: Double
             get() = ((endTimestampNs - startTimestampNs).coerceAtLeast(0L)) / 1_000_000_000.0
@@ -51,6 +51,7 @@ object MetadataManager {
     fun write(outputFile: File, metadata: SessionMetadata) {
         try {
             outputFile.parentFile?.mkdirs()
+            val tmp = File(outputFile.parentFile, "${outputFile.name}.tmp")
             val guardian = JSONObject().apply {
                 put("hands_detected_percentage", round2(metadata.guardianSummary.handsDetectedPercentage))
                 put("total_analyzed_frames", metadata.guardianSummary.totalAnalyzedFrames)
@@ -85,7 +86,11 @@ object MetadataManager {
                 )
                 put("status", metadata.status)
             }
-            outputFile.writeText(json.toString(2))
+            tmp.writeText(json.toString(2))
+            if (!tmp.renameTo(outputFile)) {
+                tmp.copyTo(outputFile, overwrite = true)
+                tmp.delete()
+            }
         } catch (e: Exception) {
             Log.e(TAG, "Failed to write metadata.json", e)
         }
