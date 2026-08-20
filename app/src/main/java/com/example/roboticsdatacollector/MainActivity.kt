@@ -111,6 +111,7 @@ class MainActivity : ComponentActivity() {
     private lateinit var eventLogger: SessionEventLogger
     private lateinit var videoRecorder: VideoRecorder
     private lateinit var sessionSafety: SessionSafetyManager
+    private lateinit var handsAlertAudio: HandsAlertAudioManager
     private var analysisExecutor: ExecutorService? = null
     private val emergencyStop = AtomicReference<((String) -> Unit)?>(null)
 
@@ -135,6 +136,7 @@ class MainActivity : ComponentActivity() {
         eventLogger = SessionEventLogger(HapticFeedbackManager(this))
         videoRecorder = VideoRecorder()
         sessionSafety = SessionSafetyManager(this) { eventLogger.isRecording }
+        handsAlertAudio = HandsAlertAudioManager(this)
         analysisExecutor = Executors.newSingleThreadExecutor()
 
         setContent {
@@ -147,6 +149,7 @@ class MainActivity : ComponentActivity() {
                         eventLogger = eventLogger,
                         videoRecorder = videoRecorder,
                         sessionSafety = sessionSafety,
+                        handsAlertAudio = handsAlertAudio,
                         analysisExecutor = analysisExecutor!!,
                         emergencyStop = emergencyStop,
                         onOpenSessions = { destination = AppScreen.Sessions },
@@ -236,6 +239,7 @@ class MainActivity : ComponentActivity() {
         try {
             sessionSafety.stopMonitoring()
             guardian.close()
+            handsAlertAudio.release()
             sensorDataManager.release()
             analysisExecutor?.shutdown()
         } catch (e: Exception) {
@@ -287,6 +291,7 @@ fun DataCollectionScreen(
     eventLogger: SessionEventLogger,
     videoRecorder: VideoRecorder,
     sessionSafety: SessionSafetyManager,
+    handsAlertAudio: HandsAlertAudioManager,
     analysisExecutor: ExecutorService,
     emergencyStop: AtomicReference<((String) -> Unit)?>,
     onOpenSessions: () -> Unit,
@@ -458,6 +463,7 @@ fun DataCollectionScreen(
             }
             qualityLogger.stop()
             CollectionForegroundService.stop(context)
+            handsAlertAudio.setCollecting(false)
             guardian.stop()
             sensorDataManager.forceFlushAndClose()
             onKeepScreenOn(false)
@@ -484,8 +490,10 @@ fun DataCollectionScreen(
         orphanSession = sessionRepository.orphanSessions().firstOrNull()
     }
 
-    DisposableEffect(guardian, context) {
+    DisposableEffect(guardian, context, handsAlertAudio) {
         guardian.onHandsOutEscalation = { eventLogger.notifyHandsOut() }
+        guardian.onNoHandsAudioAlert = { handsAlertAudio.speakNoHandsAlert() }
+        guardian.onHandsRecovered = { handsAlertAudio.cancel() }
         guardian.onQualitySample = { json ->
             json.put("thermal_status", DeviceHealth.thermalStatus(context))
             val dir = sessionRef.get()?.dir ?: context.getExternalFilesDir(null) ?: context.filesDir
@@ -495,7 +503,10 @@ fun DataCollectionScreen(
         }
         onDispose {
             guardian.onHandsOutEscalation = null
+            guardian.onNoHandsAudioAlert = null
+            guardian.onHandsRecovered = null
             guardian.onQualitySample = null
+            handsAlertAudio.cancel()
         }
     }
 
@@ -596,6 +607,7 @@ fun DataCollectionScreen(
         closeCurrentSegment()
         sensorDataManager.pauseLogging()
         eventLogger.setPaused(true)
+        handsAlertAudio.setCollecting(false)
         isPaused = true
         pauseStartedNs = SystemClock.elapsedRealtimeNanos()
         phase = CollectionPhase.PAUSED
@@ -622,6 +634,7 @@ fun DataCollectionScreen(
         }
         sensorDataManager.resumeLogging()
         eventLogger.setPaused(false)
+        handsAlertAudio.setCollecting(true)
         isPaused = false
         phase = CollectionPhase.COLLECTING
         segmentIndex += 1
@@ -645,6 +658,7 @@ fun DataCollectionScreen(
         val summary = guardian.snapshotSummary()
         sessionSafety.stopMonitoring()
         CollectionForegroundService.stop(context)
+        handsAlertAudio.setCollecting(false)
         if (isPaused && pauseStartedNs > 0L) {
             pauseIntervals.add(pauseStartedNs to SystemClock.elapsedRealtimeNanos())
         }
@@ -760,6 +774,7 @@ fun DataCollectionScreen(
 
             sensorDataManager.startLogging(session.imuFile)
             guardian.start()
+            handsAlertAudio.setCollecting(true)
             sessionSafety.startMonitoring()
             cameraController.videoCaptureQualitySelector = if (sessionConfig.profile == RecordingProfile.ENDURANCE) {
                 QualitySelector.from(Quality.HD)
@@ -779,6 +794,7 @@ fun DataCollectionScreen(
             recError = e.message
             sessionSafety.stopMonitoring()
             CollectionForegroundService.stop(context)
+            handsAlertAudio.setCollecting(false)
             guardian.stop()
             qualityLogger.stop()
             sensorDataManager.forceFlushAndClose()

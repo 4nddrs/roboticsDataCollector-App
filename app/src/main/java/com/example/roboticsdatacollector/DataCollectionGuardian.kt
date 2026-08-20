@@ -64,6 +64,10 @@ class DataCollectionGuardian(
 
     var onQualitySample: ((org.json.JSONObject) -> Unit)? = null
     var onHandsOutEscalation: (() -> Unit)? = null
+    var onNoHandsAudioAlert: (() -> Unit)? = null
+    var onHandsRecovered: (() -> Unit)? = null
+
+    private val lastNoHandsAudioStreak = AtomicInteger(-1)
 
     @Volatile
     var detectorBackend: DetectorBackend = DetectorBackend.UNINITIALIZED
@@ -110,6 +114,7 @@ class DataCollectionGuardian(
         droppedFrames.set(0)
         lastFrameTimestampNs.set(0L)
         handsOutHapticFired.set(false)
+        lastNoHandsAudioStreak.set(-1)
         lastAnalyzedElapsedNs.set(0L)
         _analyzedFrameCount.value = 0
         _isHandVisible.value = false
@@ -263,13 +268,25 @@ class DataCollectionGuardian(
             workspaceBadStreak.set(0); 0
         }
         val none = if (hands == HandVisibilityState.NONE) noneStreak.incrementAndGet() else {
+            val hadMissing = noneStreak.get() > 0
             noneStreak.set(0)
             handsOutHapticFired.set(false)
+            lastNoHandsAudioStreak.set(-1)
+            if (hadMissing) onHandsRecovered?.invoke()
             0
         }
-        val noneSeconds = none / targetAnalysisFps.coerceIn(3, 5).toFloat()
+        val fps = targetAnalysisFps.coerceIn(3, 5).toFloat()
+        val noneSeconds = none / fps
         if (noneSeconds >= 8f && handsOutHapticFired.compareAndSet(false, true)) {
             onHandsOutEscalation?.invoke()
+        }
+        if (noneSeconds >= HandsAlertAudioManager.PERSIST_SECONDS) {
+            val last = lastNoHandsAudioStreak.get()
+            val sinceLastSec = if (last < 0) Float.POSITIVE_INFINITY else (none - last) / fps
+            if (last < 0 || sinceLastSec >= HandsAlertAudioManager.COOLDOWN_SECONDS) {
+                lastNoHandsAudioStreak.set(none)
+                onNoHandsAudioAlert?.invoke()
+            }
         }
         _qualityWarning.value = when {
             obstruct >= needed -> QualityWarning.Obstructed
